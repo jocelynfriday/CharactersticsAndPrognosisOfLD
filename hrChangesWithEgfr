@@ -1,0 +1,49 @@
+#modified from code provided by Dr Dory Kovacs
+
+setwd("######")
+library(tidyverse)
+library(MASS)
+library(ggplot2)
+library(plotROC)
+library(scales)
+library(dplyr)
+library(magrittr)
+library(caret) 
+hrChanges <- function(file, baseSave){
+# Prep data 
+data = read.csv(file, na.strings = c("", "NA", " "))
+data.df = as.data.frame(data)
+
+dataNamed.df = data.df %>% 
+  dplyr::rename(`2.5%` = conf.low,
+                `97.5%` = conf.high,
+                 "covariate" = Term)
+
+noNA = dataNamed.df[complete.cases(dataNamed.df),]
+noNA$Series <- factor(noNA$Series,
+                       levels = c ("Base", "Complete", "Median", "First", "Third"), #number refers to eGFR quartile
+                       labels = c("Model 1", "Model 2", "Model 3", "Model 4", "Model 5"))
+noNA$Factor <- as.factor(noNA$Factor)
+
+noNA$covariate <- factor(noNA$covariate, 
+                        levels =  c("Neither", "HF Only", "LD Only", "Both: LD + HF"))
+cleaned = noNA %>% group_by(Factor,Series, covariate)
+
+colors = c("black","#b2df8a", "#1f78b4", "#a6cee3", "navy")
+# PLOT hazard ratios --
+pd <- position_dodge2(0.45, reverse = TRUE)
+  
+(HRs_plot = ggplot(cleaned, aes(x = covariate, y = HR), group = Factor, color = Series) + coord_flip() + 
+    geom_line(aes(color = Series), position = pd)+ theme_classic() + scale_x_discrete(limits = rev)+ 
+    scale_y_continuous(limits = c(0.9, 3.5), breaks = c( 1, 2, 3), trans = "log")+
+    geom_pointrange(aes(ymin= cleaned$`2.5%`, ymax= cleaned$`97.5%`, color = Series), position = pd,  alpha = 0.6,  size=1) +   
+    geom_hline(yintercept = 1, linetype="dotted", color = "grey", linewidth =1) + #line at OR=1
+    scale_color_manual(values = colors)+
+    xlab("") +
+    ylab("Adjusted Hazard Ratio (95% CI)"))
+svg(paste0("HR_",baseSave, "_refinedEgfr.svg"))
+print(HRs_plot)
+dev.off()
+}
+hrChanges("HRChanges.csv", "bl")
+hrChanges("tdcHRChanges.csv", "tdc")

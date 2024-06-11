@@ -1,0 +1,123 @@
+# Graph changes in changes in raw causes of mortality by person-year at risk between baseline and time-dependent patinet classification
+
+
+library(RODBC)
+library(tidyverse)
+library(lubridate)
+library(ggpubr)
+library(reprex)
+library(broom)
+library(ggsci)
+]library(grid)
+library(reshape2)
+library(ggfortify)
+library(scales)
+library(grid)
+library(gridExtra)
+library(ggtext)
+library(patchwork)
+
+#global functions
+my.format = function(x=0, ndp)format(round(x,ndp), ns=ndp, just="none", scientific = F)
+bigNumbers <- function(x=0, ndp=0)format(as.numeric(my.format(x, ndp)), big.mark=",")
+my.contSummary = function(x, ndp)(format(paste0(my.format(median(x), ndp),' (',my.format(quantile(x, 0.25), ndp)," - ",
+                                                my.format(quantile(x, 0.75), ndp), ")")))
+my.factSummary <-  function(x, tot, ndp)format(paste0(ifelse((tot < 6 & tot != 0), "<6", bigNumbers(tot)), " (",my.format(as.numeric(x), ndp),"%)"))
+my.irSummary <- function(x, tot, ndp)format(paste0(ifelse((tot < 6.0 & tot != 0), "<6", bigNumbers(tot)), " (",ifelse(my.format(as.numeric(x), ndp) < 0.01 & tot != 0, '<0.01', my.format(as.numeric(x), ndp)),")"))
+my.tableValues <- function(x, ndp=0)format(ifelse((x < 6.0 & x != 0), "<6", bigNumbers(x)))
+#global variables
+## personTimeScale (by x person-years)
+personTimeScale = 1
+## number of decimal places used in table 
+tableNdps = 0
+## number of decimal places used to report Hb
+hbNdps = 1
+## number of decimal places used to report person-time  
+personTimeNdps = 2
+
+#baseline classification 
+conn <- odbcDriverConnect("Driver=SQL Server; Server=####; Database=####")
+included <- sqlQuery(conn, 'select * from ####' )
+odbcCloseAll()
+
+included$group <- factor(included$inclusionStatusSplit, 
+                               levels = c("-1" ,"0", "1", "2", "3"),
+                               labels = c( "Neither (18-59 yrs)", "Neither (\U2265 60 yrs)", "LD Only", "HF Only", "Both: LD + HF"))
+
+
+included$codClassification <- factor(included$codClassification,
+                                     levels = c("-1", "0", "1", "2", 
+                                                "3", "4"),
+                                     labels = c("Remove", "Alive", "CV", 
+                                                "Neoplasm", "Infection", "Other"))
+
+# Time-dependent covariate classification 
+conn <- odbcDriverConnect("Driver=SQL Server; Server=####; Database=####")
+data_raw_tdc <- sqlQuery(conn, 'select * from ####' )
+odbcCloseAll()
+
+tdc <- data_raw_tdc
+tdc$updatedGroupSplit <- factor(tdc$updatedGroupSplit, 
+                                      levels = c( "-1", "0", "1", "2", "3"),
+                                      labels = c("Neither (18-59 yrs)", "Neither (\U2265 60 yrs)", "LD Only", "HF Only", "Both: LD + HF"))
+
+tdc$codReason <- factor(tdc$codReason,
+                                     levels = c("-1", "0", "1", "2", 
+                                                "3", "4"),
+                                     labels = c("Remove", "Alive", "CV", 
+                                                "Neoplasm", "Infection", "Other"))
+getBaselineByGroup <- function(included, tdc, groupName, cgc){
+
+  blPt <- sum(included$timeToDeath)
+  blMort <- included %>% dplyr::filter(died > 0) %>% group_by(codClassification) %>% dplyr::summarise(codR = n()) 
+
+  blMortPt <- unlist(lapply(blMort ,function(x) if(is.numeric(x)) round((replace_na(x, 0.00)/blPt),2)))
+  
+  tdcPt <- sum(tdc$numDaysAlive)/365.25
+  tdcMort <- tdc %>% dplyr::filter(died > 0) %>% group_by(codReason) %>% dplyr::summarise(codR = n())
+  
+  tdcMortPt <- unlist(lapply(tdcMort ,function(x) if(is.numeric(x)) round((replace_na(x, 0.00)/blPt),2)))
+  
+  deaths <- rbind(1:5,blMortPt[1:5], tdcMortPt[1:5])                 
+  deaths.df <- as.data.frame(deaths)
+  colnames(deaths.df) <- c("CV", 
+                           "Neoplasm", "Infection", "Other", "Unknown")
+  (changesInDeaths <- deaths.df %>% slice(c(2,3)) %>% t()%>% as.data.frame %>% 
+      add_rownames()%>% arrange(V1) %>% mutate(rowname= factor(rowname,
+                                                               levels =c("Other", "Infection", "Neoplasm", "CV"))) %>%
+      ggplot(aes(x=rowname, y=V1)) +
+      geom_segment(aes(x=rowname, xend=rowname, y=V1, yend=V2), color='grey')+
+      geom_point(aes(y = V1), size = 5, color=cgc, alpha=0.1)+
+      geom_point(shape = 1, size = 5, color = cgc)+
+      geom_point(aes(y = V2), size = 5, color=cgc, alpha = 0.6) +
+      coord_flip()+
+      theme_classic()+
+      theme(
+        panel.grid.minor.y = element_blank(),
+        panel.grid.major.y = element_blank(),
+        axis.text = element_text(size=16)
+      )+
+      ylim(0,0.2)+
+      ylab('Number of deaths \n per person-year at risk')+
+      xlab(''))
+  
+  svg(paste0(GroupName, "_changesInMort.svg"))
+  print(changesInDeaths)
+  dev.off()
+}
+
+labels = c( "Neither (18-59 yrs)", "Neither (\U2265 60 yrs)", "LD Only", "HF Only", "Both: LD + HF")
+colors = c("#ADB6B6FF", "#FDAF91FF", "#00468BFF", "#ED0000FF", "#925E9FFF")
+count = 1
+for(label in labels){
+  print(label)
+  
+  bl <- included %>% filter(group == label)
+  tdcG <- tdc %>% filter(updatedGroupSplit == label) 
+  print(bl %>% nrow())
+  print(tdcG %>% nrow())
+  getBaselineByGroup(bl,tdcG, paste0("group", count), colors[count])
+  count = count + 1
+}
+
+

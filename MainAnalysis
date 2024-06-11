@@ -1,0 +1,3117 @@
+
+# Do not count HF diagnosis where diagnosis occurred in death. 
+
+library(RODBC)
+library(tidyverse)
+library(survival)
+library(survminer)
+library(lubridate)
+library(ggpubr)
+library(broom)
+library(cmprsk)
+library(reshape2)
+library(splines)
+library(viridis)
+library(ggtext)
+library(patchwork)
+library(repex)
+library(ggfortify)
+library(grid)
+library(gridExtra)
+
+#global functions
+my.format = function(x=0, ndp)format(round(x,ndp), ns=ndp, just="none", scientific = F)
+bigNumbers <- function(x=0, ndp=0)format(as.numeric(my.format(x, ndp)), big.mark=",")
+my.contSummary = function(x, ndp)(format(paste0(my.format(median(x), ndp),' (',my.format(quantile(x, 0.25), ndp)," - ",
+                                                my.format(quantile(x, 0.75), ndp), ")")))
+my.factSummary <-  function(x, tot, ndp)format(paste0(ifelse((tot < 6 & tot != 0), "<6", bigNumbers(tot)), " (", my.format(as.numeric(x), ndp),"%)"))
+my.percent <-  function(x, tot, ndp)format(paste0("(",my.format(as.numeric(x), ndp),"%)"))
+my.irSummary <- function(x, tot, ndp)format(paste0(ifelse((tot < 6.0 & tot != 0), "<6", bigNumbers(tot)), " (", ifelse(my.format(as.numeric(x), ndp) < 0.01 & tot != 0, '<0.01', my.format(as.numeric(x), ndp)),")"))
+my.tableValues <- function(x, ndp=0)format(ifelse((x < 6.0 & x != 0), "<6", bigNumbers(x)))
+
+#global variables
+## personTimeScale (by x person-years)
+personTimeScale = 1
+## number of decimal places used in table 
+tableNdps = 0
+## number of decimal places used to report Hb
+hbNdps = 1
+## number of decimal places used to report person-time 
+personTimeNdps = 2
+
+#Connection details obscured for security
+conn <- odbcDriverConnect("Driver=SQL Server; Server=####; Database=####")
+data_raw<- sqlQuery(conn, 'select * from #####' )
+odbcCloseAll()
+
+included <- data_raw %>% dplyr::filter(included == 1)
+
+included$inclusionStatus <- factor(included$inclusionStatus, 
+                                   levels = c( "0", "1", "2", "3"),
+                                   labels = c("Neither", "LD Only", "HF Only", "Both: LD + HF"))
+included$group <- factor(included$inclusionStatusSplit, 
+                         levels = c("-1" ,"0", "1", "2", "3"),
+                         labels = c( "Neither (18-59 yrs)", "Neither (\u2265 60 yrs)", "LD Only", "HF Only", "Both: LD + HF"))
+
+included$finalGroup <- factor(included$finalStatusSplit, 
+                         levels = c("-1" ,"0", "1", "2", "3"),
+                         labels = c( "Neither (18-59 yrs)", "Neither (\u2265 60 yrs)", "LD Only", "HF Only", "Both: LD + HF"))
+
+
+age <- included %>% group_by(sex, group = "Age (years)") %>% dplyr::summarise(value = my.contSummary(ageEnd2011, tableNdps)) %>% 
+  spread(group, value) %>% as.data.frame()
+
+ageAll <- included %>% group_by(sex = "All", group = "Age (years)") %>% dplyr::summarise(value = my.contSummary(ageEnd2011, tableNdps)) %>% 
+  spread(group, value) %>% as.data.frame()
+
+ages <- age %>% add_row(ageAll)
+write.csv(ages, "MedianAgeTotal.csv")
+
+##################################
+#         Format Data           #
+##################################
+
+included$SIMD <- factor(included$SIMD)
+included$sex <- as.factor(included$sex)
+included$ethnicity <- as.factor(included$ethnicity)
+included <- included %>% dplyr::mutate(ethnicityGrouped = recode_factor(ethnicity, "Asian" = "Other", "Black" = "Other"))
+included$ethnicityGrouped <- ordered(included$ethnicityGrouped, levels = c("White", "Missing", "Other"))
+
+
+
+included$codClassification <- factor(included$codClassification,
+                        levels = c("-1", "0", "1", "2", 
+                                   "3", "4"),
+                        labels = c("Remove", "Alive", "Cardiovascular", 
+                                   "Neoplasm", "Infection", "Other"))
+
+##################################
+#       Lenght of follow-up      #
+##################################
+#calculate median, 1st-3rd quartile lengths of follow-up 
+
+fuTime <- data.frame("Reason" = c("Included"), "value" = c(included %>% nrow()))
+
+fut <- included %>% dplyr::summarise(totalTime = sum(timeToDeath))
+fuTime <- fuTime %>% add_row(Reason = "Follow-up time (years)", value = fut$totalTime)
+
+mfut <- included %>% dplyr::summarise(totalTime = median(timeToDeath))
+fuTime <- fuTime %>% add_row(Reason = "Median follow-up time (years)", value = mfut$totalTime)
+
+mfut <- included %>% dplyr::summarise(totalTime = quantile(timeToDeath, 0.25))
+fuTime <- fuTime %>% add_row(Reason = "1st quartile follow-up time (years)", value = mfut$totalTime)
+
+mfut <- included %>% dplyr::summarise(totalTime = quantile(timeToDeath, 0.75))
+fuTime <- fuTime %>% add_row(Reason = "3rd quartile follow-up time (years)", value = mfut$totalTime)
+
+
+##################################
+#        Tables 1 & 2 Data       #
+##################################
+
+egfravailable <- included %>% dplyr::filter(!is.na(egfr))
+hbavailable <- included %>% dplyr::filter(!is.na(hb))
+
+sample_size <- included %>% dplyr::group_by(group) %>% dplyr::summarize(num = n())
+sample_sizeEgfr <- egfravailable %>%  dplyr::group_by(group) %>% dplyr::summarize(num = n())
+sample_sizeHb <- hbavailable %>%  dplyr::group_by(group) %>% dplyr::summarize(num = n())
+
+#n
+n <- included %>% dplyr::group_by(group, variable = 'n') %>% 
+  dplyr::summarise(value = bigNumbers(n())) %>% 
+  spread(group, value) %>% as.data.frame() 
+
+age <- included %>% dplyr::group_by(group, variable = 'Age (years)') %>% 
+  dplyr::summarise(value = my.contSummary(ageEnd2011, tableNdps)) %>% 
+  spread(group, value) %>% as.data.frame()
+
+#baseline age below 60 years of age
+under60 <- included %>% dplyr::filter(under60 > 0) %>% 
+  dplyr::group_by(group, variable = "Under 60 years of age") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(variable = replace_na(variable, "Under 60 years of age")) %>% 
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+ageSex <- included %>% dplyr::group_by(group, variable = paste0("Age (years): ", sex)) %>% 
+dplyr::summarise(value = my.contSummary(ageEnd2011, tableNdps)) %>% 
+  spread(group, value) %>% as.data.frame()
+
+#sex
+sex <- included %>% dplyr::group_by(group, variable = sex) %>% 
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#ethnicity
+ethnicity <- included %>% dplyr::group_by(group, variable = ethnicityGrouped) %>% 
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  #dplyr::mutate(variable = replace_na(variable, "ethnicityGrouped")) %>% 
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummaryOld(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#SIMD
+SIMD <- included %>% dplyr::group_by(group, variable = SIMD) %>% 
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  # dplyr::mutate(variable = replace_na(variable, "SIMD")) %>% 
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#HF recorded in hospital 
+hfRecordInHosp <- included %>% dplyr::filter(hfHosp > 0) %>% 
+  dplyr::group_by(group, variable = "HF in SMR01") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_sizeHF) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Atrial fibrillation/flutter
+af <- included %>% dplyr::filter(af > 0) %>% 
+  dplyr::group_by(group, variable = "Atrial fibrillation/flutter") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Valve disease
+valve <- included %>% dplyr::filter(valve > 0) %>% 
+  dplyr::group_by(group, variable = "Valve disease") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Hypertension
+hypertension <- included %>% dplyr::filter(hypertension > 0) %>% 
+  dplyr::group_by(group, variable = "Hypertension") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Diabetes mellitus
+dm <- included %>% dplyr::filter(dm > 0) %>% 
+  dplyr::group_by(group, variable = "Diabetes mellitus") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Coronary artery disease (including myocardial infarction)
+cad <- included %>% dplyr::filter(cad > 0) %>% 
+  dplyr::group_by(group, variable = "CAD (including MI)") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Myocardial infarction
+mi <- included %>% dplyr::filter(mi > 0) %>% 
+  dplyr::group_by(group, variable = "Myocardial infarction") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Peripheral arterial disease
+pad <- included %>% dplyr::filter(pad > 0) %>% 
+  dplyr::group_by(group, variable = "Peripheral arterial disease") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Cancer
+cancer <- included %>% dplyr::filter(cancer > 0) %>% 
+  dplyr::group_by(group, variable = "Cancer") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Stroke
+stroke <- included %>% dplyr::filter(stroke > 0) %>% 
+  dplyr::group_by(group, variable = "Stroke") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Dementia
+dementia <- included %>% dplyr::filter(dementia > 0) %>% 
+  dplyr::group_by(group, variable = "Dementia") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#COPD
+copd <- included %>% dplyr::filter(copd > 0) %>% 
+  dplyr::group_by(group, variable = "COPD") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Liver disease, defined by the presence of liver fibrosis, sclerosis, or cirrhosis 
+liver <- included %>% dplyr::filter(liver > 0) %>% 
+  dplyr::group_by(group, variable = "Liver") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Thyroid disease
+thyroid <- included %>% dplyr::filter(thyroidDisease > 0) %>% 
+  dplyr::group_by(group, variable = "Thyroid disease") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Estimated glomerular filtration rate (eGFR) measurements
+egfrIn2Prior <- included %>% dplyr::filter(!is.na(egfr)) %>% 
+  dplyr::group_by(group, variable = "Patient-record of eGFR in prior 2 years") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#median eGFR (1st - 3rd quartile)
+egfr <- included %>% dplyr::filter(!is.na(egfr)) %>% 
+  dplyr::group_by(group, variable = 'eGFR') %>% 
+  dplyr::summarise(value = my.contSummary(egfr, tableNdps)) %>% 
+  spread(group, value) %>% as.data.frame()
+
+#eGFR between 30-59 mL/min/1.73m^2, inclusive
+egfrLt60Closest <- egfravailable %>% dplyr::filter(lowEgfr > 0) %>% 
+  dplyr::group_by(group, variable = "Closest eGFR [30-59]") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_sizeEgfr) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#eGFR < 30 mL/min/1.73m^2
+egfrLt30Closest <- egfrAvailable %>% dplyr::filter(lt30Egfr > 0) %>% 
+  dplyr::group_by(group, variable = "Closest eGFR < 30") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_sizeEgfr) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+# Haemoglobin (Hb)
+hbIn2Prior <- included %>% dplyr::filter(!is.na(hb) > 0) %>% 
+  dplyr::group_by(group, variable = "Patient-record of Hb in prior 2 years") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+# median Hb (1st - 3rd quartile) by sex 
+hb <- hbavailable %>% dplyr::filter(!is.na(hb)) %>% 
+  dplyr::group_by(group, variable = paste0(sex, ': Hb')) %>% 
+  dplyr::summarise(value = my.contSummary(hb/10, hbNdps)) %>% 
+  spread(group, value) %>% as.data.frame()
+
+#Anaemia Using the World Health Organization's definition of anaemia
+anaemiaClosest <- hbavailable %>% dplyr::filter(anaemia > 0) %>% 
+  dplyr::group_by(group, variable = "Closest Hb shows anaemia") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_sizeHb) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+table1 <- bind_rows(n, age, ageSex, under60, sex, ethnicity, SIMD, hfRecordInHosp, hypertension, dm, thyroid,
+                    cad, mi, pad, valve, af, stroke, copd, liver, cancer, dementia,
+                    egfrIn2Prior, egfr, egfrLt60Closest, egfrLt30Closest,
+                    hbIn2Prior, hb, anaemiaClosest)
+
+#save table 1
+write.csv(table1, "table1.csv")
+
+# Baseline meds dispensed in the 180 days before 1 Jan 2012
+# ACEi or ARB
+aceiOrArb <- included %>% dplyr::filter(aceiOrArb > 0) %>% 
+  dplyr::group_by(group, variable = "ACEi or ARB") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#ACEi
+acei <- included %>% dplyr::filter(acei > 0) %>% 
+  dplyr::group_by(group, variable = "ACEi") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#ARB
+arb <- included %>% dplyr::filter(arb > 0) %>% 
+  dplyr::group_by(group, variable = "ARB") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Beta-blockers
+bb <- included %>% dplyr::filter(bb > 0) %>% 
+  dplyr::group_by(group, variable = "Beta-blocker") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#MRAs
+mra <- included %>% dplyr::filter(mra > 0) %>% 
+  dplyr::group_by(group, variable = "MRA") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Calcium channel blockers
+ccb <- included %>% dplyr::filter(caBlocker > 0) %>% 
+  dplyr::group_by(group, variable = "Calcium channel blocker") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Diltiazem/verapamil
+diltVerap <- included %>% dplyr::filter(diltVerap > 0) %>% 
+  dplyr::group_by(group, variable = "Diltiazem/Verapamil") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Dihydropyridiness
+dihydropyridines <- included %>% dplyr::filter(dihydropyridines > 0) %>% 
+  dplyr::group_by(group, variable = "Dihydropyridines") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Digoxin
+dig <- included %>% dplyr::filter(digoxin > 0) %>% 
+  dplyr::group_by(group, variable = "Digoxin") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Thiazides and related
+thiazides <- included %>% dplyr::filter(thiazide > 0) %>% 
+  dplyr::group_by(group, variable = "Thiazides +") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#NSAIDs
+nsaids <- included %>% dplyr::filter(nsaids > 0) %>% 
+  dplyr::group_by(group, variable = "NSAIDs") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()  
+
+# Low-dose aspirin
+aspirin <- included %>% dplyr::filter(aspirin > 0) %>% 
+  dplyr::group_by(group, variable = "Low-dose aspirin") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Oral anticoagulants
+oralAnticoag <- included %>% dplyr::filter(oralAnticoagulants > 0) %>% 
+  dplyr::group_by(group, variable = "Oral anticoagulants") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Lipid regulating agents
+lipidReg <- included %>% dplyr::filter(lipidReg > 0) %>% 
+  dplyr::group_by(group, variable = "Lipid regulator") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Bronchodilators
+bronchodilator <- included %>% dplyr::filter(bronchodilator > 0) %>% 
+  dplyr::group_by(group, variable = "Bronchodilator") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Thyroid medications
+ThyroidMed <- included %>% dplyr::filter(ThyroidMed > 0) %>% 
+  dplyr::group_by(group, variable = "Thyroid medication") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Hypoglycaemic agents
+hypoglycaemics <- included %>% dplyr::filter(dmAllT > 0) %>% 
+  dplyr::group_by(group, variable = "Hypoglycaemic agents") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Insulin
+insulin <- included %>% dplyr::filter(dmInsulin > 0) %>% 
+  dplyr::group_by(group, variable = "Insulin") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+# Other hypoglycaemic agents
+dmtOther <- included %>% dplyr::filter(dmOther > 0) %>% 
+  dplyr::group_by(group, variable = "Other hypoglycaemic agents") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+
+#medications
+table2 <- bind_rows(n, age, aceiOrArb, acei, arb, bb, mra,  ccb, diltVerap, dihydropyridines, dig, thiazides, 
+                     nsaids, aspirin, oralAnticoag, lipidReg, bronchodilator, ThyroidMed, hypoglycaemics, insulin, 
+                     dmtOther)
+write.csv(table2, "table2.csv")
+
+##########################################
+# ECG and ECHO values at last transition #
+##########################################
+
+#Define factor levels 
+report <- within(included, {
+    `Final Group` <- finalGroup
+  
+   `ECG Rhythm` <-factor(rhythmFinal, 
+                                levels = c("-1", "3", "2", "1", "0"),
+                                labels = c("No ECG", "Undetermined", "Other", "AF/AFL/SVT", "Sinus"))
+  
+   `LVEF` <-factor(lvefCategoryFinal, 
+                                 labels = c("No Echo", "Missing LVEF", "> 70%", "60-70%", "50%-59%", 
+                                            "41%-49%", "30%-40%", "< 30%"))
+  
+  `LA Dimension Classification` <-factor(laDimensionCategoryFinal, 
+                                         labels = c("No Echo", "Missing LA Dimension","W:< 2.7cm/ M:< 3.0cm",  "W:2.7-3.2cm/ M:3.0-3.4cm",
+                                                    "W:3.3-3.8cm/ M:3.5-4.0cm", "W:3.9-4.2cm/ M:4.1-4.6cm",
+                                                    "W:4.3-4.6cm/ M:4.7-5.2cm", "W:\u2265 4.7cm/ M:\u2265 5.3cm"))
+  
+})
+
+#ECG rhythm measurements 
+svg("groupECGPercentFinal.svg")
+##set colour 
+colorCount <- length(unique(report$`ECG Rhythm`))
+getPalette = colorRampPalette(brewer.pal(colorCount, "YlGn"))(colorCount)
+#calculate scaling factor(cohort group size)
+sample_size <- report %>% dplyr::group_by(`Final Group`) %>%  dplyr::summarize(num=n())
+
+##add the number of individuals in each column
+hold <- sample_size %>% mutate(grouped = paste0(`Final Group`, "\n(n = ", bigNumbers(num, 0), ")")) %>% select(-c(`Final Group`, num))
+my.labels <- c(t(hold))
+
+##create plot
+(p <- report %>% full_join(sample_size) %>% 
+    group_by(`Final Group`, `ECG Rhythm`, num) %>% dplyr::summarise(catTot = n()) %>%
+    mutate(norm = (catTot/(num*1.0)) *100) %>% 
+    ggplot(aes(y=norm, x=`Final Group`, fill=`ECG Rhythm`, color =`ECG Rhythm` )) + 
+    geom_bar(position = 'stack', stat = 'identity', color = "white") + theme_classic()  + 
+    scale_x_discrete(labels = my.labels)+
+    scale_fill_manual(values=colorRampPalette(brewer.pal(8, "YlGn"))(colorCount)) +
+    scale_y_continuous(breaks = c(0,20,40,60,80,100))+
+    xlab ('Group') + 
+    ylab ('Percentage')+ 
+    theme(axis.text.x = element_text(angle=45, hjust = 1)))
+print(p)
+dev.off()
+
+#Subset to those with an ECG
+present <- report %>% filter(`ECG Rhythm` != 'No ECG')
+
+##set colour 
+colorCount <- length(unique(report$`ECG Rhythm`))
+getPalette = colorRampPalette(brewer.pal(colorCount, "YlGn"))(colorCount)
+
+##calculate scaling factor(group size)
+sample_size <- present %>% dplyr::group_by(`Final Group`) %>%  dplyr::summarize(num=n())
+
+##add the number of individuals in each column
+hold <- sample_size %>% mutate(grouped = paste0(`Final Group`, "\n(n = ", bigNumbers(num, 0), ")")) %>% select(-c(`Final Group`, num))
+my.labels <- c(t(hold))
+
+##create plot
+(p <- present %>% full_join(sample_size) %>% 
+    group_by(`Final Group`, `ECG Rhythm`, num) %>% dplyr::summarise(catTot = n()) %>%
+    mutate(norm = (catTot/(num*1.0)) *100) %>% 
+    ggplot(aes(y=norm, x=`Final Group`, fill=`ECG Rhythm`, color =`ECG Rhythm` )) + 
+    geom_bar(position = 'stack', stat = 'identity', color = "white") + theme_classic()  + 
+    scale_x_discrete(labels = my.labels)+
+    scale_y_continuous(breaks = c(0,20,40,60,80,100))+
+    scale_fill_manual(values=getPalette[2:5]) +
+    xlab ('Group') + 
+    ylab ('Percentage')+ 
+    theme(axis.text.x = element_text(angle=45, hjust = 1)))
+svg("groupECGPresentPercentFinal.svg")
+print(p)
+dev.off()
+
+#Left ventricular ejection fraction (LVEF) measurements 
+## set colour 
+colorCount <- length(unique(report$lvefCategoryFinal))
+
+sample_size <- report %>% dplyr::group_by(`Final Group`) %>%  dplyr::summarize(num=n())
+hold <- sample_size %>% mutate(grouped = paste0(`Final Group`, "\n(n = ", bigNumbers(num, 0), ")")) %>% select(-c(`Final Group`, num))
+my.labels <- c(t(hold))
+
+
+##create plot
+(p <- report %>% full_join(sample_size) %>% 
+    group_by(`Final Group`, `LVEF`, num) %>% dplyr::summarise(catTot = n()) %>%
+    mutate(norm = (catTot/(num*1.0)) *100) %>% 
+    ggplot(aes(y=norm, x=`Final Group`, fill=`LVEF`, color = `LVEF` )) + 
+    geom_bar(position = 'stack', stat = 'identity', color = "white") + 
+    scale_x_discrete(labels = my.labels)+
+    theme_classic()  + 
+    scale_fill_viridis_d(direction = -1, option = "turbo")+
+    scale_y_continuous(breaks = c(0,20,40,60,80,100))+
+    xlab ('Group') + 
+    ylab ('Percentage')+ 
+    guides(fill=guide_legend(title = "LVEF Classification"))+
+    theme(axis.text.x = element_text(angle=45, hjust = 1)))
+svg("groupLVEFEchoPercentFinal.svg")
+print(p)
+dev.off()
+
+
+##Subset to those with an LVEF
+present <- report %>% filter(`LVEF` != 'No Echo' & `LVEF` != "Missing LVEF")
+missing <- report %>% filter(`LVEF` == 'No Echo' | `LVEF` == "Missing LVEF")
+
+##set colour 
+colorCount <- length(unique(report$lvefCategoryFinal))
+
+##prepare text for the bottom label
+sample_size <- present %>% dplyr::group_by(`Final Group`) %>%  dplyr::summarize(num=n())
+hold <- sample_size %>% mutate(grouped = paste0(`Final Group`, "\n(n = ", bigNumbers(num, 0), ")")) %>% select(-c(`Final Group`, num))
+my.labels <- c(t(hold))
+
+##prepare text for the top label
+topNum <- report %>% dplyr::group_by(`Final Group`) %>%  dplyr::summarize(tot=n()) %>% add_column(withRecord = sample_size$num) %>%
+  dplyr::mutate(percentRecord = (withRecord/tot)*100)
+
+topLabTot <- missing  %>% dplyr::group_by(`Final Group`) %>% dplyr::summarize(num=n()) %>%  dplyr::mutate(n = paste0(bigNumbers(num, 0))) %>% select(-c(`Final Group`, num))
+my.topTotLabels <- c(t(topLabTot))
+
+topLabPerc <- topNum %>% dplyr::mutate(n = my.factSummary(percentRecord, withRecord, tableNdps)) %>% select(-c(`Final Group`, tot, percentRecord, withRecord))
+my.topPercLabs <- c(t(topLabPerc))
+
+##create plot
+(p <- present %>% full_join(sample_size) %>% 
+    group_by(`Final Group`, `LVEF`, num) %>% dplyr::summarise(catTot = n()) %>%
+    mutate(norm = (catTot/(num*1.0)) *100) %>% 
+    ggplot(aes(y=norm, x=`Final Group`, fill=`LVEF`, color = `LVEF` )) + 
+    geom_bar(position = 'stack', stat = 'identity', color = 'white') + 
+    guides(fill=guide_legend(title = "LVEF Classification"))+
+    scale_y_continuous(breaks = c(0,20,40,60,80,100))+
+    theme_classic()  + 
+    scale_fill_viridis_d(direction = -1, begin = 0, end = 1 - 2*(1.0/colorCount), option = 'turbo')+
+    xlab ('Group') + 
+    ylab ('Percentage')+ 
+    coord_cartesian(clip = "off") + 
+    theme(axis.text.x = element_text(angle=45, hjust = 1))+
+    geom_text(aes(x = `Final Group`, y = 107, label = my.topTotLabels),
+              inherit.aes = FALSE, data = sample_size, size = 3.2, fontface = "plain") +
+    geom_text(aes(x = "Both: LD + HF", y = 107), label = "N missing", 
+              inherit.aes = FALSE, data = sample_size, size = 3.2, hjust = 0, nudge_x = 0.5, 
+              fontface = "plain", family = "sans")+
+    geom_text(aes(x = `Final Group`, y = 103, label = my.topPercLabs), 
+              inherit.aes = FALSE, data = sample_size, size = 3.2, 
+              fontface = "plain", family = "sans") +   
+    geom_text(aes(x = "Both: LD + HF", y = 103), label = "With a record (%)", 
+              inherit.aes = FALSE, data = sample_size, size = 3.2, hjust = 0, nudge_x = 0.5, 
+              fontface = c("plain"), family = "sans") )
+svg("groupLVEFPesentEchoPercentAnnotatedAFinal.svg")
+print(p)
+dev.off()
+
+
+#Left atrial (LA) dimension values
+##Set colour 
+colorCount <- length(unique(report$laDimensionStatusFinal))
+
+##prep for labels
+sample_size <- report %>% dplyr::group_by(`Final Group`) %>%  dplyr::summarize(num=n())
+
+##add the number of individuals in each column
+hold <- sample_size %>% mutate(grouped = paste0(`Final Group`, "\n(n = ", bigNumbers(num, 0), ")")) %>% select(-c(`Final Group`, num))
+my.labels <- c(t(hold))
+
+##create plot
+(p <- report %>% full_join(sample_size) %>% 
+    group_by(`Final Group`, `LA Dimension Classification`, num) %>% dplyr::summarise(catTot = n()) %>%
+    mutate(norm = (catTot/(num*1.0)) *100) %>% 
+    ggplot(aes(y=norm, x=`Final Group`, fill= `LA Dimension Classification`, color = `LA Dimension Classification`)) + 
+    geom_bar(position = 'stack', stat = 'identity', color = "white") + 
+    scale_x_discrete(labels = my.labels)+
+    scale_y_continuous(breaks = c(0,20,40,60,80,100))+
+    theme_classic()  + 
+    guides(fill = guide_legend(title = "LA Dimension Classification"))+
+    scale_fill_viridis_d(direction = -1, option = "turbo") +
+    xlab ('Group') + 
+    ylab ('Percentage')+ 
+    theme(axis.text.x = element_text(angle=45, hjust = 1)))
+svg("groupLaDimensionEchoPercentFinal.svg")
+print(p)
+dev.off()
+
+
+#subset 
+allLAD <- report %>% filter(`LA Dimension Classification` != "No Echo" & `LA Dimension Classification` != "Missing LA Dimension" )
+missingLAD <- report %>% filter(`LA Dimension Classification` == "No Echo" | `LA Dimension Classification` == "Missing LA Dimension" )
+
+##set colour 
+colorCount <- length(unique(report$laDimensionCategoryFinal))
+
+##prep labels 
+sample_size <- allLAD %>% dplyr::group_by(`Final Group`) %>%  dplyr::summarize(num=n())
+
+##add number of individuals in each column
+hold <- sample_size %>% mutate(grouped = paste0(`Final Group`, "\n(n = ", bigNumbers(num, 0), ")")) %>% select(-c(`Final Group`, num))
+my.labels <- c(t(hold))
+
+##prepare text for top label
+topNum <- report %>% dplyr::group_by(`Final Group`) %>%  dplyr::summarize(tot=n()) %>% add_column(withRecord = sample_size$num) %>%
+  dplyr::mutate(percentRecord = (withRecord/tot)*100)
+
+topLabTot <- missingLAD  %>% dplyr::group_by(`Final Group`) %>% dplyr::summarize(num=n()) %>%  dplyr::mutate(n = paste0(bigNumbers(num, 0))) %>% select(-c(`Final Group`, num))
+my.topTotLabels <- c(t(topLabTot))
+
+topLabPerc <- topNum %>% dplyr::mutate(n = my.factSummary(percentRecord, withRecord, tableNdps)) %>% select(-c(`Final Group`, tot, percentRecord, withRecord))
+my.topPercLabs <- c(t(topLabPerc))
+
+##create plot
+(p <- allLAD %>% full_join(sample_size) %>% 
+    group_by(`Final Group`, `LA Dimension Classification`, num) %>% dplyr::summarise(catTot = n()) %>%
+    mutate(norm = (catTot/(num*1.0)) *100) %>% 
+    ggplot(aes(y=norm, x=`Final Group`, fill= `LA Dimension Classification`, color = `LA Dimension Classification`)) + 
+    geom_bar(position = 'stack', stat = 'identity', color = 'white') + 
+    theme_classic()  + 
+    scale_y_continuous(breaks = c(0,20,40,60,80,100))+
+    coord_cartesian(clip = "off") + 
+    scale_fill_viridis(direction = -1, option = "turbo", discrete = TRUE, begin = 0, end= (1-2*(1/colorCount))) +
+    xlab ('Group') + 
+    ylab ('Percentage')+ 
+    guides(fill = guide_legend(title = "LA Dimension Classification"))+
+    theme(axis.text.x = element_text(angle=45, hjust = 1)) +
+    geom_text(aes(x = `Final Group`, y = 107, label = my.topTotLabels),
+              inherit.aes = FALSE, data = sample_size, size = 3, fontface = "plain") +
+    geom_text(aes(x = "Both: LD + HF", y = 107), label = "N missing", 
+              inherit.aes = FALSE, data = sample_size, size = 3, hjust = 0, nudge_x = 0.6, 
+              fontface = "plain", family = "sans")+
+    geom_text(aes(x = `Final Group`, y = 103, label = my.topPercLabs), 
+              inherit.aes = FALSE, data = sample_size, size = 3, 
+              fontface = "plain", family = "sans") +   
+    geom_text(aes(x = "Both: LD + HF", y = 103), label = "With a record (%)", 
+              inherit.aes = FALSE, data = sample_size, size = 3, hjust = 0, nudge_x = 0.6, 
+              fontface = c("plain"), family = "sans"))
+
+svg("groupLaDimensionPresentEchoPercentAnnotatedFinal.svg")
+print(p)
+dev.off()
+
+
+# Continue formatting 
+included$finalStatusSplit <- factor(included$finalStatusSplit,
+                                    levels = c("-1", "0", "1", "2", "3"), 
+                                    labels = c("Neither (18-59 yrs)", "Neither (\u2265 60 yrs)", "LD Only", "HF Only", 
+                                               "Both: LD + HF"))
+included$rhythmFinal <-factor(included$rhythmFinal, 
+                         levels = c("-1", "3", "2", "1", "0"),
+                         labels = c("No ECG", "Undetermined", "Other", "AF/AFL/SVT", "Sinus"))
+
+included$escLVEFClassificationFinal <- factor(included$escLVEFClassificationFinal,
+                                         levels = c("0", "1", "2"), 
+                                         labels = c(">= 50%", "(40% - 50%)", "<= 40%"))
+
+#using furthest classification
+ecg <- included %>% dplyr::filter(!is.na(ecgTestDateFinal) > 0)
+echo <- included %>% dplyr::filter(!is.na(echoDateFinal) > 0)
+lad <-  echo %>% dplyr::filter(!is.na(laDimensionFinal)) 
+ef <- echo %>% dplyr::filter(!is.na(lvefFinal))
+qt <- ecg %>% dplyr::filter(!is.na(QTcFinal))
+
+sample_size <- included %>% dplyr::group_by(finalStatusSplit) %>% dplyr::summarize(num = n())
+sample_sizeFinal <- included %>% dplyr::group_by(finalStatusSplit) %>% dplyr::summarize(num = n())
+sample_sizeFinal_ecg <- ecg %>% dplyr::group_by(finalStatusSplit) %>% dplyr::summarize(num = n())
+sample_sizeFinal_qt <- qt %>% dplyr::group_by(finalStatusSplit) %>% dplyr::summarize(num = n())
+sample_sizeFinal_echo <- echo %>% dplyr::group_by(finalStatusSplit) %>% dplyr::summarize(num = n())
+sample_sizeFinal_echoLad <- lad %>% dplyr::group_by(finalStatusSplit) %>% dplyr::summarize(num = n())
+sample_sizeFinal_echoLvef <- ef %>% dplyr::group_by(finalStatusSplit) %>% dplyr::summarize(num = n())
+
+
+#number
+n <- included %>% dplyr::group_by(finalStatusSplit, variable = 'n') %>% 
+  dplyr::summarise(value = bigNumbers(n())) %>% 
+  spread(finalStatusSplit, value) %>% as.data.frame() 
+
+#ECG
+anyECG <- included %>% dplyr::filter(!is.na(ecgTestDateFinal) > 0) %>% 
+  dplyr::group_by(finalStatusSplit, variable = "ECG recorded 2009-12-31 through censoring") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_sizeFinal) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(finalStatusSplit, value) %>% as.data.frame()
+
+#QRS Duration
+qrs <- ecg %>% dplyr::filter(!is.na(qrsDurationFinal)) %>% 
+  dplyr::group_by(finalStatusSplit, variable = 'QRS duration') %>% 
+  dplyr::summarise(value = my.contSummary(qrsDurationFinal, tableNdps)) %>% 
+  spread(finalStatusSplit, value) %>% as.data.frame()
+
+#Rhythm
+rhythm <- ecg %>% dplyr::group_by(finalStatusSplit, variable = rhythmFinal) %>% 
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_sizeFinal_ecg) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  #dplyr::mutate(variable = replace_na(variable, "ethnicityGrouped")) %>% 
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummaryOld(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(finalStatusSplit, value) %>% as.data.frame()
+
+#ECHO available
+echoAny <- included %>% dplyr::filter(!is.na(echoDateFinal) > 0) %>% 
+  dplyr::group_by(finalStatusSplit, variable = "Echo recorded 2009-12-31 through censoring") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_sizeFinal) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(finalStatusSplit, value) %>% as.data.frame()
+
+#LVEF available
+efRecorded <- echo %>% dplyr::filter(!is.na(lvefFinal) > 0) %>% 
+  dplyr::group_by(finalStatusSplit, variable = "LVEF Available in latest echo") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_sizeFinal_echo) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(finalStatusSplit, value) %>% as.data.frame()
+
+# LVEF phenotype 
+efClass <- ef %>% dplyr::group_by(finalStatusSplit, variable = escLVEFClassificationFinal) %>% 
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_sizeFinal_echoLvef) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  #dplyr::mutate(variable = replace_na(variable, "ethnicityGrouped")) %>% 
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummaryOld(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(finalStatusSplit, value) %>% as.data.frame()
+
+#LA dimension recorded 
+ladRecorded <- echo %>% dplyr::filter(!is.na(laDimensionFinal) > 0) %>% 
+  dplyr::group_by(finalStatusSplit, variable = "LAD Available in closest echo") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_sizeFinal_echo) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(finalStatusSplit, value) %>% as.data.frame()
+
+#LA dimension dilated
+laDimensionDilated <- lad %>% dplyr::filter(laDimensionDilatedFinal > 0) %>% 
+  dplyr::group_by(finalStatusSplit, variable = "LA dilated") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_sizeFinal_echoLad) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(finalStatusSplit, value) %>% as.data.frame()
+
+invest <- bind_rows(n, anyECG, qrs, rhythm,
+                     echoAny, efRecorded, efClass, 
+                     ladRecorded, laDimensionDilated)
+#save
+write.csv(invest, "FinalInvestigations.csv")
+
+#####################################################
+#     Inclusion status morbidity and mortality      #
+#####################################################
+
+sample_size <- included %>% dplyr::group_by(group) %>% dplyr::summarize(num = n(), pt = sum(numDaysFree)/365.25)
+
+sample_sizeMort <- included %>% dplyr::group_by(group) %>% dplyr::summarize(num = n(), pt = sum(timeToDeath))
+
+included$codReason <- factor(included$codReason,
+                        levels = c("-1", "0", "1", "2", 
+                                   "3", "4"),
+                        labels = c("Remove", "Alive", "Cardiovascular", 
+                                   "Neoplasm", "Infection", "Other"))
+
+n <- included %>% dplyr::group_by(group, variable = 'n') %>% 
+  dplyr::summarise(value = bigNumbers(n())) %>% 
+  spread(group, value) %>% as.data.frame() 
+
+#died
+died <- included %>% dplyr::filter(died > 0) %>% 
+  dplyr::group_by(group, variable = "Died") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per, pt))%>%
+  spread(group, value) %>% as.data.frame()
+
+#Underlying cause of death
+reasonForMortP <- included %>% dplyr::group_by(group, variable = codReason) %>% 
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>% 
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per, pt))%>%
+  spread(group, value)  %>% as.data.frame()
+
+#Underlying cause of death per person-year at risk
+reasonForMortPt <- included %>% dplyr::group_by(group, variable = codReason) %>% 
+  dplyr::summarise(top = sum(died)) %>% 
+  dplyr::full_join (sample_sizeMort) %>% 
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+#count of those admitted
+admitted <- included %>% dplyr::filter(!is.na(firstHospAdmDate)) %>% 
+  dplyr::group_by(group, variable = "Admitted") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per, pt))%>%
+  spread(group, value) %>% as.data.frame()
+
+#number of admissions
+numAdmissions <- included %>% dplyr::group_by(group, variable = 'Number of admissions') %>% 
+  dplyr::summarise(value = my.contSummary(numHospAdmit, tableNdps)) %>% 
+  spread(group, value) %>% as.data.frame()
+
+#number of admissions per patient-year at risk
+##total
+numAdmissionsPt <- included %>% dplyr::filter(!is.na(firstHospAdmDate)) %>% 
+  dplyr::group_by(group, variable = "Number of admissions") %>%
+  dplyr::summarise(top = sum(numHospAdmit)) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>%
+  dplyr::mutate(value = my.irSummary(ir, top, personTimeNdps)) %>% 
+  dplyr::select(-c(top, ir, num, pt, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+##HF
+hfAdmit <- included %>% dplyr::filter(!is.na(firstHospAdmDate)) %>%
+  dplyr::group_by(group, variable = "HF") %>% 
+  dplyr::summarise(top = sum(numHfHospAdmit)) %>%
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+##CV other
+cvOtherAdmit <- included %>% dplyr::filter(!is.na(firstHospAdmDate)) %>%
+  dplyr::group_by(group, variable = "CV Other") %>% 
+  dplyr::summarise(top = sum(numCvOtherHospAdmit)) %>%
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+##Renal
+renalAdmit <- included %>% dplyr::filter(!is.na(firstHospAdmDate)) %>% 
+  dplyr::group_by(group, variable = "Renal") %>% 
+  dplyr::summarise(top = sum(numRenalHospAdmit)) %>%
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+##Eye & adnexa
+eyeAdmit <- included %>% dplyr::filter(!is.na(firstHospAdmDate)) %>% 
+  dplyr::group_by(group, variable = "Eye & Adnexa") %>% 
+  dplyr::summarise(top = sum(numEyeHospAdmit)) %>%
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+##Digestive disease
+giAdmit <- included %>% dplyr::filter(!is.na(firstHospAdmDate)) %>%
+  dplyr::group_by(group, variable = "Digestive disease") %>% 
+  dplyr::summarise(top = sum(numGiHospAdmit)) %>%
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+##Chronic respiratory disease
+respAdmit <- included %>% dplyr::filter(!is.na(firstHospAdmDate)) %>%
+  dplyr::group_by(group, variable = "Chronic respiratory diseases") %>% 
+  dplyr::summarise(top = sum(numRespHospAdmit)) %>%
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+##Infection
+infectAdmit <- included %>% dplyr::filter(!is.na(firstHospAdmDate)) %>% 
+  dplyr::group_by(group, variable = "Infection") %>% 
+  dplyr::summarise(top = sum(numInfectHospAdmit)) %>%
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+##Injury
+injuryAdmit <- included %>% dplyr::filter(!is.na(firstHospAdmDate)) %>%
+  dplyr::group_by(group, variable = "Injury") %>% 
+  dplyr::summarise(top = sum(numInjuryHospAdmit)) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+##Mental Health & neurological disorders
+mentNeuroAdmit <- included %>% dplyr::filter(!is.na(firstHospAdmDate)) %>% 
+  dplyr::group_by(group, variable = "Mental health & neurological disorders") %>% 
+  dplyr::summarise(top = sum(numMentNeuroHospAdmit)) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+##Musculoskeletal
+mskAdmit <- included %>% dplyr::filter(!is.na(firstHospAdmDate)) %>% 
+  dplyr::group_by(group, variable = "Musculoskeletal") %>% 
+  dplyr::summarise(top = sum(numMskHospAdmit)) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+##Neoplasm
+neopAdmit <- included %>% dplyr::filter(!is.na(firstHospAdmDate)) %>% 
+  dplyr::group_by(group, variable = "Neoplasm") %>% 
+  dplyr::summarise(top = sum(numNeoplasmHospAdmit)) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+##Other
+otherAdmit <- included %>% dplyr::filter(!is.na(firstHospAdmDate)) %>% 
+  dplyr::group_by(group, variable = "Other") %>% 
+  dplyr::summarise(top = sum(numOtherHospAdmit)) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+admTbl <- bind_rows(n, died, reasonForMortP, admitted, numAdmissions, numAdmissionsPt)
+
+write.csv(admTbl, "BaselineAdmissions.csv")
+
+#pull together admission types per patient-year at risk
+admitPt <- bind_rows(hfAdmit, cvOtherAdmit, respAdmit, infectAdmit, neopAdmit,
+                     renalAdmit, eyeAdmit, giAdmit,
+                     injuryAdmit, mentNeuroAdmit, 
+                     mskAdmit,  otherAdmit)
+
+#define colors
+admitPt$variable <- factor(admitPt$variable, levels=unique(admitPt$variable))
+colorsActiveBarGraph <- c("#ADB6B6FF", "#FDAF91FF", "#00468BFF", "#ED0000FF", "#925E9FFF") #per group color
+
+pal <- viridis_pal(direction = -1,  option = "H")(12)
+mortPal <- c("#BE2102FF", "#FE922AFF", "#F1CA3AFF", "#30123BFF") #modified from viridis
+
+#plot morbidity and mortality per patient-year at risk
+svg("mortRateByBaselineGroup_cc.svg")
+(p <- reasonForMortPt %>%dplyr::filter(variable != "Alive") %>%
+    ggplot(aes(x=group, y = value, fill = variable)) + 
+    geom_bar(stat='identity', color = 'white') +
+    theme_classic()  + 
+    scale_fill_manual(values = mortPal) +
+    xlab ('Group') + 
+    ylab ('Number of deaths\n per patient-year at risk')+ 
+    theme(axis.text.x = element_text(angle=45, hjust = 1))+
+    guides(fill=guide_legend(title = "Cause of death")))
+print(p)
+dev.off()
+
+svg("mortRateByBaselineGroupDodge.svg")
+(p <- reasonForMortPt %>%dplyr::filter(variable != "Alive") %>%
+    ggplot(aes(x=variable, y = value, fill = group)) + 
+    geom_bar(stat='identity',position = 'dodge', color = 'white') +
+    theme_classic()  + 
+    scale_fill_manual(values = colorsActiveBarGraph,  name = "Group") + 
+    xlab ('Group') + 
+    ylab ('Number of deaths\n per patient-year at risk')+ 
+    theme(axis.text.x = element_text(angle=45, hjust = 1))+
+    guides(fill=guide_legend(title = "Cause of death")))
+print(p)
+dev.off()  
+
+svg("hospRateByBaselineGroupDodge.svg")
+(p <- ggplot(admitPt, aes(x=variable, y = value, fill = group)) + 
+    geom_bar(stat='identity',position = 'dodge', color = 'white') +
+    theme_classic()  + 
+    scale_fill_manual(values = colorsActiveBarGraph,  name = "Group") + 
+    xlab ('Admission Reason') + 
+    ylab ('Number of admissions\n per patient-year at risk')+ 
+    theme(axis.text.x = element_text(angle=45, hjust = 1))+
+    guides(fill=guide_legend(title = "Group")))
+print(p)
+dev.off()
+
+svg("hospRateByBaselineGroup.svg")
+(p <- ggplot(admitPt, aes(x=group, y = value, fill = variable)) + 
+    geom_bar(stat='identity', color = 'white') +
+    theme_classic()  + 
+    scale_fill_viridis_d(option = "turbo", direction = -1) +
+    xlab ('Group') + 
+    ylab ('Number of admissions\n per patient-year at risk')+ 
+    theme(axis.text.x = element_text(angle=45, hjust = 1))+
+    guides(fill=guide_legend(title = "Admission Reason")))
+print(p)
+dev.off()
+
+##################################
+#         Time to event          #
+##################################
+#Format data
+included$hfOrDeathFlag <- factor(included$hfOrDeathFlag, 
+                                 labels = c("censored", "Diagnosis of HF", "Death prior to a diagnosis of HF"))
+included$ldOrDeathFlag <- factor(included$ldOrDeathFlag, 
+                                 labels = c("censored", "LD", "Died"))
+
+included$ldHfDeathFlag <- factor(included$ldHfDeathFlag, 
+                                 labels = c("Remove", "censored", "Died", "Iniated LD", "Diagnosed with HF"))
+
+included$incLDtoDeathFlag <- factor(included$incLDtoDeathFlag, 
+                                 labels = c("Remove", "censored", "Died"))
+
+included$incHFtoDeathFlag <- factor(included$incHFtoDeathFlag, 
+                                    labels = c("Remove", "censored", "Died"))
+
+included <- included %>% dplyr::mutate(ageDec = ageEnd2011/10)
+included$SIMD <- relevel(included$SIMD, ref = "5") #reference is the least deprived
+
+data <- included %>% dplyr::filter(group != "Both: LD + HF" & group != "HF Only")
+data$group <-factor(data$group)
+
+#time to diagnosis of HF or all-cause mortality
+ci_hf <- cmprsk::cuminc(ftime = data$timeToHfOrDeath, fstatus = data$hfOrDeathFlag, group = data$inclusionStatusSplit,
+                        cencode = "censored")
+
+write(capture.output(ci_hf), "Ci_rate_hf.txt")
+
+##plot event development of heart failure or all-cause mortality
+###method from Emily Zabor tutorials on survival analysis
+ciHfPlotDat <- ci_hf %>%
+  list_modify("Tests" = NULL) %>% 
+  map_df(`[`, c("time", "est"), .id = "id") %>% 
+  mutate(id = recode(
+    id, 
+    "-1 Diagnosis of HF" = "-1: Diagnosis of HF",
+    "-1 Death prior to a diagnosis of HF" = "-1: Death prior to a diagnosis of HF",
+    "0 Diagnosis of HF" = "0: Diagnosis of HF",
+    "0 Death prior to a diagnosis of HF" = "0: Death prior to a diagnosis of HF",
+    "1 Diagnosis of HF" = "1: Diagnosis of HF",
+    "1 Death prior to a diagnosis of HF" = "1: Death prior to a diagnosis of HF")
+  ) %>% 
+  separate(id, c("Group", "Event"), ": ")
+
+ciHfPlotDat = ciHfPlotDat %>% 
+  dplyr::mutate(Group = factor(Group, 
+                               levels = c(-1, 0, 1),
+                               labels = c("Neither (18-59 yrs)", "Neither (\u2265 60 yrs)", "LD Only")))
+###plot
+(p <- ggplot(ciHfPlotDat, aes(x = time, y = est, color = Group)) +
+  geom_step(lwd = 1.2, aes(linetype = Event))+
+  theme_classic() + 
+  scale_linetype_manual(values = c("twodash", "solid")) +
+  color_palette(c("#ADB6B6FF", "#FDAF91FF", "#00468BFF"))+
+  ylim(c(0, 0.4)) +
+  theme(plot.title = element_text(size = 14),
+        legend.title = element_blank(),
+        legend.position = "bottom") +
+    guides(linetype = "none")+
+  labs(x = "Time (years)", 
+       y = "Cumulative incidence") + 
+   annotate("Text", x=0.1, y = 0.35, size = 5, hjust = 0, label = "Solid lines = incident HF\nBroken lines = death without diagnosis of HF")
+  )
+
+###calculate the number remaining table
+meldedHf_fit <- survfit(Surv(timeToHfOrDeath, ifelse(hfOrDeathFlag != "censored", 1, 0)) ~ group, 
+                        data = data)
+
+(numHf <- ggsurvplot(
+  fit = meldedHf_fit, 
+  data = data,
+  xscale = c("d_y"),
+  risk.table = TRUE,
+  palette = c("#ADB6B699", "#FDAF91FF", "#00468BFF"),
+  risk.table.y.text = FALSE, 
+  ylab = "Time (years)", 
+  risk.table.fontsize = 3.2, 
+  tables.theme = theme_survminer(font.main = 14),
+  title = "Tests"
+))
+
+###combine the plot and risk table 
+(combHf <- cowplot::plot_grid(
+  p, 
+  numHf$table + theme_cleantable(), 
+  ncol = 1, 
+  rel_heights = c(4,1),
+  align = "v", 
+  axis = "b"
+))
+
+svg("cmprks_hfWithTable.svg")
+print(combHf)
+dev.off()
+
+##plotting the single event type - development of heart failure
+### Only one event of interest, yet still want to account for the competing risk of all-cause mortality
+
+###create a Tidy dataset
+ciHfPlotDat1 <- ci_hf %>% 
+  list_modify("Tests" = NULL) %>% 
+  map_df(`[`, c("time", "est"), .id = "id") %>%
+  filter(id %in% c("-1 Diagnosis of HF", "0 Diagnosis of HF", "1 Diagnosis of HF")) %>% 
+  mutate("Group" = recode(
+    id, 
+    "-1 Diagnosis of HF" = "-1",
+    "0 Diagnosis of HF" = "0",
+    "1 Diagnosis of HF" = "1")
+  )
+
+ciHfPlotDat1 = ciHfPlotDat1 %>% 
+               dplyr::mutate(Group = factor(Group, 
+                               levels = c(-1, 0, 1),
+                               labels = c("Neither (18-59 yrs)", "Neither (\u2265 60 yrs)", "LD Only")))
+###plot
+(p <- ggplot(ciHfPlotDat1, aes(x = time, y = est, color = Group)) +
+  geom_step(lwd = 1.2) + 
+  color_palette(c("#ADB6B699","#FDAF91FF", "#00468BFF"))+
+  ylim(c(0, 0.4)) + 
+  theme_classic() + 
+  theme(plot.title = element_text(size = 14),
+        legend.title = element_blank(), 
+        legend.position = "bottom") + 
+  labs(x = "Time (years)", 
+       y = "Cumulative incidence")
+  )
+
+###add the numbers at risk table 
+(meldedHf_plot <- ggplot(ciHfPlotDat1, aes(x = time, y = est, color = Group)) + 
+  geom_step(lwd = 1.2) + 
+  ylim(c(0, 0.4)) + 
+  color_palette(c("#ADB6B699","#FDAF91FF", "#00468BFF"))+
+  theme_classic() +
+  theme(plot.title = element_text(size = 14),
+        legend.title = element_blank(),
+        legend.position = "bottom") +
+  labs(x = "Time (years)", 
+       y = "Cumulative incidence")
+)
+
+###get the number at risk table from a ggsurvplot using survfit where all events count as a single composite endpoint
+###Make sure colours and line types match for group labels 
+
+meldedHf_fit <- survfit(Surv(timeToHfOrDeath, ifelse(hfOrDeathFlag != "censored", 1, 0)) ~ group, 
+                        data = data
+)
+
+numHf <- ggsurvplot(
+  fit = meldedHf_fit, 
+  data = data,
+  risk.table = TRUE,
+  risk.table.y.text = FALSE, 
+  palette = c("#ADB6B699","#FDAF91FF", "#00468BFF"),
+  ylab = "Time (years)", 
+  risk.table.fontsize = 3.2, 
+  tables.theme = theme_survminer(font.main = 14),
+  title = "Tests"
+)
+
+###combine the plot and risk table 
+(combHf <- cowplot::plot_grid(
+  meldedHf_plot, 
+  numHf$table + theme_cleantable(), 
+  ncol = 1, 
+  rel_heights = c(4,1),
+  align = "v", 
+  axis = "b"
+))
+
+svg("Ci_devHfWithRskTbl.svg")
+print(combHf)
+dev.off()
+
+##Time to death from incident diagnosis of HF during follow-up
+data <- included %>% dplyr::filter(incHFFlag == 1)
+
+data$group <-factor(data$group)
+
+ci_hfDeath <- cmprsk::cuminc(ftime = data$timeToIncHFtoDeath, fstatus = data$incHFtoDeathFlag, group = data$incHFToDeathLDStat,
+                             cencode = "censored")
+
+write(capture.output(ci_hfDeath), "Ci_rate_incHfDeath.txt")
+
+###Format data
+ciLdPlotDat <- ci_hfDeath %>%
+  list_modify("Tests" = NULL) %>% 
+  map_df(`[`, c("time", "est"), .id = "id") %>% 
+  mutate(id = recode(
+    id, 
+    "0 Died" = "0: Died",
+    "1 Died" = "1: Died")
+  ) %>% 
+  separate(id, c("Group", "Event"), ": ")
+
+ciLdPlotDat = ciLdPlotDat %>% 
+  dplyr::mutate(Group = factor(Group, 
+                               levels = c(0,1),
+                               labels = c("Death without prior LD", "Death with prior LD")))
+
+###plot
+(p <- ggplot(ciLdPlotDat, aes(x = time, y = est, color = Group)) +
+    geom_step(lwd = 1.2, aes(linetype = Event))+
+    theme_classic() + 
+    color_palette(c("#1B1919FF", "#0088B4FF"))+
+    ylim(c(0, 1)) +
+    theme(plot.title = element_text(size = 14),
+          legend.title = element_blank(),
+          legend.position = "bottom") +
+    guides(linetype = "none") + 
+    labs(x = "Time (years)", 
+         y = "Cumulative incidence")
+)
+###calculate number at risk 
+meldedLd_fit <- survfit(Surv(timeToIncHFtoDeath, ifelse(incHFtoDeathFlag != "censored", 1, 0)) ~ incHFToDeathLDStat, 
+                        data = data)
+
+(numLd <- ggsurvplot(
+  fit = meldedLd_fit, 
+  data = data,
+  xscale = c("d_y"),
+  risk.table = TRUE,
+  palette = c("#1B1919FF", "#0088B4FF"),
+  risk.table.y.text = FALSE, 
+  ylab = "Time (years)", 
+  risk.table.fontsize = 3.2, 
+  tables.theme = theme_survminer(font.main = 14),
+  title = "Tests"
+))
+
+###combine the plot and risk table 
+(combLd <- cowplot::plot_grid(
+  p, 
+  numLd$table + theme_cleantable(), 
+  ncol = 1, 
+  rel_heights = c(4,1),
+  align = "v", 
+  axis = "b"
+))
+
+svg("cmprks_WithTable_fromIncHF.svg")
+print(combLd)
+dev.off()
+
+#Time to loop diuretic
+data <- included %>% dplyr::filter(group != "Both: LD + HF" & group != "LD Only")
+
+
+data$group <-factor(data$group)
+
+ci_ld <- cmprsk::cuminc(ftime = data$timeToLdOrDeath, fstatus = data$ldOrDeathFlag, group = data$inclusionStatusSplit,
+                        cencode = "censored")
+
+write(capture.output(ci_ld), "Ci_rate_ld.txt")
+
+#plot event initiation of LD
+##method from Emily Zabor tutorials on survival analysis - https://www.emilyzabor.com/tutorials/survival_analysis_in_r_tutorial.html
+ciLdPlotDat <- ci_ld %>%
+  list_modify("Tests" = NULL) %>% 
+  map_df(`[`, c("time", "est"), .id = "id") %>% 
+  mutate(id = recode(
+    id, 
+    "-1 LD" = "-1: Initiation of LD",
+    "-1 Died" = "-1: Death prior to the initiation of LD",
+    "0 LD" = "0: Initiation of LD",
+    "0 Died" = "0: Death prior to the initiation of LD",
+    "2 LD" = "2: Initiation of LD",
+    "2 Died" = "2: Death prior to the initiation of LD")
+  ) %>% 
+  separate(id, c("Group", "Event"), ": ")
+
+ciLdPlotDat = ciLdPlotDat %>% 
+  dplyr::mutate(Group = factor(Group, 
+                               levels = c(-1, 0, 2),
+                               labels = c("Neither (18-59 yrs)", "Neither (\u2265 60 yrs)", "HF Only")))
+
+###plot
+(p <- ggplot(ciLdPlotDat, aes(x = time, y = est, color = Group)) +
+    geom_step(lwd = 1.2, aes(linetype = Event))+
+    theme_classic() + 
+    scale_linetype_manual(values = c("twodash", "solid")) +
+    color_palette(c("#ADB6B6FF", "#FDAF91FF", "#ED0000FF"))+
+    ylim(c(0, 0.4)) +
+    theme(plot.title = element_text(size = 14),
+          legend.title = element_blank(),
+          legend.position = "bottom") +
+    guides(linetype = "none")+
+    labs(x = "Time (years)", 
+         y = "Cumulative incidence") + 
+    annotate("Text", x=0.1, y = 0.35, size = 5, hjust = 0, label = "Solid lines = initiation of LD\nBroken lines = death without initiation of LD")
+
+)
+
+###Calculate number at risk 
+meldedLd_fit <- survfit(Surv(timeToLdOrDeath, ifelse(ldOrDeathFlag != "censored", 1, 0)) ~ group, 
+                        data = data)
+
+(numLd <- ggsurvplot(
+  fit = meldedLd_fit, 
+  data = data,
+  xscale = c("d_y"),
+  risk.table = TRUE,
+  palette = c("#ADB6B699", "#FDAF91FF", "#ED0000FF"),
+  risk.table.y.text = FALSE, 
+  ylab = "Time (years)", 
+  risk.table.fontsize = 3.2, 
+  tables.theme = theme_survminer(font.main = 14),
+  title = "Tests"
+))
+
+###combine the plot and risk table 
+(combLd <- cowplot::plot_grid(
+  p, 
+  numLd$table + theme_cleantable(), 
+  ncol = 1, 
+  rel_heights = c(4,1),
+  align = "v", 
+  axis = "b"
+))
+
+svg("cmprks_ldWithTable.svg")
+print(combLd)
+dev.off()
+
+##plotting the single event type - initiation of loop diuretics
+### only one event of interest, still want to account for competing risk of all-cause mortality
+
+###create a Tidy dataset
+ciLdPlotDat1 <- ci_ld %>% 
+  list_modify("Tests" = NULL) %>% 
+  map_df(`[`, c("time", "est"), .id = "id") %>%
+  filter(id %in% c("-1 LD", "0 LD", "2 LD")) %>% 
+  mutate("Group" = recode(
+    id, 
+    "-1 LD" = "-1",
+    "0 LD" = "0",
+    "2 LD" = "2")
+  )
+
+ciLdPlotDat1 = ciLdPlotDat1 %>% 
+  dplyr::mutate(Group = factor(Group, 
+                               levels = c(-1, 0, 2),
+                               labels = c("Neither (18-59 yrs)", "Neither (\u2265 60 yrs)", "HF Only")))
+
+###plot
+(p <- ggplot(ciHfPlotDat1, aes(x = time, y = est, color = Group)) +
+    geom_step(lwd = 1.2) + 
+    color_palette(c("#ADB6B699","#FDAF91FF", "#ED0000FF"))+
+    ylim(c(0, 0.4)) + 
+    theme_classic() + 
+    theme(plot.title = element_text(size = 14),
+          legend.title = element_blank(),
+          legend.position = "bottom") +
+    labs(x = "Time (years)", 
+         y = "Cumulative incidence")
+)
+
+
+###add the numbers at risk table 
+(meldedLd_plot <- ggplot(ciLdPlotDat1, aes(x = time, y = est, color = Group)) + 
+    geom_step(lwd = 1.2) + 
+    ylim(c(0, 0.4)) + 
+    color_palette(c("#ADB6B699","#FDAF91FF", "#ED0000FF"))+
+    theme_classic() +
+    theme(plot.title = element_text(size = 14),
+          legend.title = element_blank(),
+          legend.position = "bottom") +
+    labs(x = "Time (years)", 
+         y = "Cumulative incidence") 
+)
+
+###get the number at risk table from ggsurvplot using survfit where all events count as a single composite endpoint
+###make sure colours and line types match for group labels 
+
+meldedLd_fit <- survfit(Surv(timeToLdOrDeath, ifelse(ldOrDeathFlag != "censored", 1, 0)) ~ group, 
+                        data = data
+)
+
+numLd <- ggsurvplot(
+  fit = meldedLd_fit, 
+  data = data,
+  risk.table = TRUE,
+  risk.table.y.text = FALSE, 
+  palette = c("#ADB6B699","#FDAF91FF", "#ED0000FF"),
+  ylab = "Time (years)", 
+  risk.table.fontsize = 3.2, 
+  tables.theme = theme_survminer(font.main = 14),
+  title = "Tests"
+)
+
+###combine the plot and risk table 
+(combLd <- cowplot::plot_grid(
+  meldedLd_plot, 
+  numLd$table + theme_cleantable(), 
+  ncol = 1, 
+  rel_heights = c(4,1),
+  align = "v", 
+  axis = "b"
+))
+
+svg("Ci_devLdWithRskTbl.svg")
+print(combLd)
+dev.off()
+
+##Time to death from incident initiation of loop diuretics during follow-up
+data <- included %>% dplyr::filter(incLDFlag == 1)
+
+data$group <-factor(data$group)
+
+ci_ldDeath <- cmprsk::cuminc(ftime = data$timeToIncLDtoDeath, fstatus = data$incLDtoDeathFlag, group = data$incLDToDeathHFStat,
+                        cencode = "censored")
+
+write(capture.output(ci_ldDeath), "Ci_rate_incLdDeath.txt")
+
+###format data
+ciLdPlotDat <- ci_ldDeath %>%
+  list_modify("Tests" = NULL) %>% 
+  map_df(`[`, c("time", "est"), .id = "id") %>% 
+  mutate(id = recode(
+    id, 
+    "0 Died" = "0: Died",
+    "1 Died" = "1: Died")
+  ) %>% 
+  separate(id, c("Group", "Event"), ": ")
+
+ciLdPlotDat = ciLdPlotDat %>% 
+  dplyr::mutate(Group = factor(Group, 
+                               levels = c(0,1),
+                               labels = c("Death without a diagnosis of HF", "Death with a diagnosis of HF")))
+
+###plot
+(p <- ggplot(ciLdPlotDat, aes(x = time, y = est, color = Group)) +
+    geom_step(lwd = 1.2, aes(linetype = Event))+
+    theme_classic() + 
+    color_palette(c("#1B1909FF", "#AD002AFF"))+
+    ylim(c(0, 1)) +
+    theme(plot.title = element_text(size = 14),
+          legend.title = element_blank(),
+          legend.position = "bottom") +
+    guides(linetype = "none") +
+    labs(x = "Time (years)", 
+         y = "Cumulative incidence")
+)
+
+svg("Ci_Custom_InitiationOfLD_fromIncLD_ggplot.svg")
+print(p)
+dev.off()
+
+meldedLd_fit <- survfit(Surv(timeToIncLDtoDeath, ifelse(incLDtoDeathFlag != "censored", 1, 0)) ~ incLDToDeathHFStat, 
+                        data = data)
+
+(numLd <- ggsurvplot(
+  fit = meldedLd_fit, 
+  data = data,
+  xscale = c("d_y"),
+  risk.table = TRUE,
+  palette = c("#1B1909FF", "#AD002AFF"),
+  risk.table.y.text = FALSE, 
+  ylab = "Time (years)", 
+  risk.table.fontsize = 3.2, 
+  tables.theme = theme_survminer(font.main = 14),
+  title = "Tests"
+))
+
+###combine the plot and risk table 
+(combLd <- cowplot::plot_grid(
+  p, 
+  numLd$table + theme_cleantable(), 
+  ncol = 1, 
+  rel_heights = c(4,1),
+  align = "v", 
+  axis = "b"
+))
+
+svg("cmprks_WithTable_fromIncLD.svg")
+print(combLd)
+dev.off()
+
+###########################
+#   Population Estiames   #
+###########################
+
+colorsGrouped <- c("#ADB6B6FF", "#00468BFF", "#ED0000FF", "#925E9FFF")
+conn <- odbcDriverConnect("Driver=SQL Server; Server=#####; Database=######")
+data_raw_hb2 <- sqlQuery(conn, "select * from [#####].[#####] where HB like '%Glasgow%' and sex <> 'All'" )
+odbcCloseAll()
+
+hb2 <- data_raw_hb2 %>% dplyr::select(., 1:2)
+hb2 <- hb2 %>%  mutate(`18-29` = dplyr::select(data_raw_hb2,22:33) %>% rowSums())
+hb2 <- hb2 %>% mutate(`30-34` = dplyr::select(data_raw_hb2,34:38) %>% rowSums())
+hb2 <- hb2 %>% mutate(`35-39` = dplyr::select(data_raw_hb2,39:43) %>% rowSums())
+hb2 <- hb2 %>% mutate(`40-44` = dplyr::select(data_raw_hb2,44:48) %>% rowSums())
+hb2 <- hb2 %>% mutate(`45-49` = dplyr::select(data_raw_hb2,49:53) %>% rowSums())
+hb2 <- hb2 %>% mutate(`50-54` = dplyr::select(data_raw_hb2,54:58) %>% rowSums())
+hb2 <- hb2 %>% mutate(`55-59` = dplyr::select(data_raw_hb2,59:63) %>% rowSums())
+hb2 <- hb2 %>% mutate(`60-64` = dplyr::select(data_raw_hb2,64:68) %>% rowSums())
+hb2 <- hb2 %>% mutate(`65-69` = dplyr::select(data_raw_hb2,69:73) %>% rowSums())
+hb2 <- hb2 %>% mutate(`70-74` = dplyr::select(data_raw_hb2,74:78) %>% rowSums())
+hb2 <- hb2 %>% mutate(`75-79` = dplyr::select(data_raw_hb2,79:83) %>% rowSums())
+hb2 <- hb2 %>% mutate(`80-84` = dplyr::select(data_raw_hb2,84:88) %>% rowSums())
+hb2 <- hb2 %>% mutate(`85-89` = dplyr::select(data_raw_hb2,89:93) %>% rowSums())
+hb2 <- hb2 %>% mutate(`90+` = dplyr::select(data_raw_hb2,94) %>% rowSums())
+
+hb2 <- hb2 %>% dplyr::select(-c(HB))
+#pivot from wide to tall
+HB2 <-  hb2  %>% 
+  pivot_longer(!c( sex), 
+               names_to = "ageA2", 
+               values_to = "pop.est")
+
+HB2$sex <- as.factor(HB2$sex)
+
+HB2Age <- HB2 %>% group_by(ageA2) %>% summarise(pop.est = sum(pop.est)) 
+
+sex_Names <- c(
+  "F" = "Women", 
+  "M" = "Men"
+)
+
+included$inclusionStatusGGC <- factor(included$inclusionStatus,
+                                      levels = c("Neither", "LD Only", "HF Only", "Both: LD + HF" ),
+                                         labels = c("Neither HF nor LD", "LD Only", "HF Only", "Both: LD + HF"))
+
+shGroup_ageSexGrouped <- included %>% dplyr::group_by(inclusionStatusGGC, sex, ageA2) %>% dplyr::summarise(n = n_distinct(safehavenid)) %>%
+  inner_join(sample_size_ageSex) %>% mutate(percent = n/(tot*1.0)*100)
+
+holdAge <- dfAttempt2 %>% dplyr::group_by(inclusionStatusGGC, ageA2) %>% ungroup() %>%
+  group_by(ageA2) %>% dplyr::summarise(inCohort = sum(n)) %>% ungroup() %>%
+  inner_join(HB2Age) %>% mutate(remaining = pop.est - inCohort) %>% ungroup()
+
+
+levels(dfAttempt2$inclusionStatusGGC) <- c(levels(dfAttempt2$inclusionStatusGGC), "Population not in cohort")
+
+#Greater Glasgow and Clyde population
+new <- data.frame(inclusionStatusGGC = rep("Population not in cohort", 14), 
+                  ageA2 = rep("age", 14),
+                  n = 0, 
+                  percent = 0,
+                  ypos = 0)
+
+combined <- rbind(dfAttempt2, new)
+for(i in 1:nrow(ages)){
+  print(56+i)
+  combined$ageA2[56+i] <- combined$ageA2[i]
+  combined$n[56+i] <- holdAge$remaining[i]
+}
+
+combinedAge <- combined %>% select(-c(tot, percent, ypos)) %>% inner_join(holdAge) %>% 
+  dplyr::select(-c(remaining, inCohort)) %>% 
+  dplyr::mutate(percent = n/(pop.est*1.0)*100)
+
+combinedAge$inclusionStatusGGC <-  factor(combinedAge$inclusionStatusGGC)
+
+combinedAge$inclusionStatusGGC <- factor(combinedAge$inclusionStatusGGC,
+                                      levels = c("Population not in cohort", "Neither HF nor LD", "LD Only", "HF Only", "Both: LD + HF"))
+
+ggcColorsGrouped <- c("black", "#ADB6B6FF", "#00468BFF", "#ED0000FF", "#924E9FFF")
+
+
+## add sex split 
+dfGgcSexSplit <- shGroup_ageSexGrouped 
+holdAge <- included %>% dplyr::group_by(inclusionStatusGGC, ageA2, sex) %>% ungroup() %>%
+  group_by(ageA2, sex) %>% dplyr::summarise(inCohort = n()) %>%
+  inner_join(HB2) %>% dplyr::mutate(remaining = pop.est - inCohort) %>% ungroup()
+
+levels(dfGgcSexSplit$inclusionStatusGGC) <- c(levels(dfGgcSexSplit$inclusionStatusGGC), "Population not in cohort")
+
+holdAge <- holdAge %>% arrange(sex)
+new <- data.frame(inclusionStatusGGC = rep("GG&C Population not in cohort", 28), 
+                  sex = "F",
+                  ageA2 = rep("age", 28),
+                  n = 0, 
+                  percent = 0,
+                  ypos = 0)
+
+combinedSexAge <- rbind(dfGgcSexSplit, new)
+for(i in 1:nrow(holdAge)){
+  print(112+i)
+  combinedSexAge$ageA2[112+i] <- combinedSexAge$ageA2[i]
+  combinedSexAge$sex[112+i] <- combinedSexAge$sex[i]
+  combinedSexAge$n[112+i] <- holdAge$remaining[i]
+}
+
+combinedAgeSex <- combinedSexAge %>% select(-c(tot, percent, ypos)) %>% inner_join(holdAge) %>% 
+  dplyr::select(-c(remaining, inCohort)) %>% 
+  dplyr::mutate(percent = n/(pop.est*1.0)*100)
+
+combinedAgeSex$inclusionStatusGGC <-  factor(combinedAgeSex$inclusionStatusGGC)
+
+combinedAgeSex$inclusionStatusGGC <-  factor(combinedAgeSex$inclusionStatusGGC,
+                                       levels = c("Population not in cohort", "Neither HF nor LD", "LD Only", "HF Only", "Both: LD + HF"))
+
+
+(ggcAgeSexBreakdown <- ggplot(combinedAgeSex, aes(x = ageA2, y = percent, group = inclusionStatusGGC, fill = inclusionStatusGGC)) +
+    geom_bar(stat = "identity") +
+    facet_wrap(~sex, labeller = labeller(sex = as_labeller(sex_Names, label_parsed))) +
+    scale_y_continuous("Percentage of GG&C age group (%)") + scale_x_discrete("Age group (years)") + theme_classic() + 
+    theme(axis.text.x = element_text(angle=45, hjust = 1))+
+    scale_fill_manual(values = ggcColorsGrouped)+
+    guides(fill=guide_legend(title = "Group"))) 
+
+svg("ggcAgeSexBreakdown.svg")
+print(ggcAgeSexBreakdown)
+dev.off()
+
+###########################
+#    Survival Analysis    #
+###########################
+#checking Cox PH assumptions
+
+##Cutting eGFR up into deciles
+included <- included %>% mutate(decEgfr = gtools::quantcut(egfr, q = 10))
+included <- included %>% mutate(decEgfrMedian = gtools::quantcut(egfrMedian, q = 10))
+included <- included %>% mutate(decEgfr1stQ = gtools::quantcut(egfr1stQ, q = 10))
+included <- included %>% mutate(decEgfr3rdQ = gtools::quantcut(egfr3rdQ, q = 10))
+
+hold <- aggregate(egfr~ decEgfr, data = included, FUN = mean)
+coxcheckEgfr <- coxph(Surv(timeToDeath, died) ~ inclusionStatus + ageEnd2011 + sex + SIMD + 
+                                                   af+ cad + dm + cancer + valve +
+                                                    hypertension + stroke + pad + 
+                                                  copd + thyroidDisease + dementia + 
+                       decEgfr, data = included)
+logHazards <- c(0, 0.72068, 0.68081,  0.67639 , 0.67277, 0.72206, 0.74919, 0.89234, 1.13318, 1.94268)
+
+ meanEgfr <- c(37.18257, 57.04671, 67.72825, 75.14110, 81.59804, 87.03178, 91.49275, 95.94608, 101.74892, 113.40100 )
+ blCoxCheckEgfr <- data.frame(logHazards, meanEgfr)
+ plot(blCoxCheckEgfr)
+ #needs splines
+
+## Cutting age up into deciles 
+included <- included %>% mutate(decAges = gtools::quantcut(ageEnd2011, q = 10))
+
+hold <- aggregate(ageEnd2011~ decAges, data = included, FUN = mean)
+coxcheckAge <- coxph(Surv(timeToDeath, died) ~ inclusionStatus + decAges + sex + SIMD + 
+                            af+ cad + dm + cancer + valve +
+                            hypertension + stroke + pad + copd + thyroidDisease + dementia, data = included)
+
+
+logHazards <- c(0, 0.45600, 0.79188, 1.14439, 1.47599, 1.77880, 2.11379, 2.44090, 2.79062, 3.44880)
+meanAges <- c(32.56772, 46.55538, 52.92555, 57.94030, 62.62448, 66.74661, 71.09661, 75.38106, 80.04458, 87.43072 )
+blCoxCheckAge <- data.frame(logHazards, meanAges)
+plot(blCoxCheckAge)
+
+## Test log -log(S(t)) for variables (assumptions testing)
+blgroupCox <- survfit(Surv(timeToDeath, died) ~  inclusionStatus, data = included, robust = TRUE)
+(p <- ggsurvplot(blgroupCox, fun = "cloglog", 
+                 palette = colorsGrouped,
+                 legend.labs = c(
+                   "Neither",
+                   "LD Only",
+                   "HF Only",
+                   "Both: LD + HF"),
+                 legend.title = "Group"))
+svg("logSurvPlot_group_bl.svg")
+print(p)
+dev.off()
+
+plot(blgroupCox, fun = "cloglog")
+(p <- ggsurvplot(blgroupCox, fun = "cloglog", 
+                 palette = colorsGrouped,
+                 legend.labs = c(
+                   "Neither",
+                   "LD Only",
+                   "HF Only",
+                   "Both: LD + HF"),
+                 legend.title = "Group") )
+(p$plot + 
+    geom_vline(xintercept = 0.039))
+svg("logSurvPlot_group_blAnnotated.svg")
+print((p$plot + 
+         geom_vline(xintercept = 0.039, linetype = 2) + 
+         annotate("text", x = 0.041, y = -0.2, label = "t = 0.039" , vjust = 0, hjust= 0)))
+dev.off()
+
+
+blVar <- survfit(Surv(timeToDeath, died) ~  sex, data = included, robust = TRUE)
+(p <- ggsurvplot(blVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("Women", "Men"),
+                 legend.title = "Sex"))
+svg("logSurvPlot_sex_bl.svg")
+print(p)
+dev.off()
+
+total <- data.frame("Reason" = c("Number of Deaths in 5 years"), "value" = c(included %>% filter(died > 0 ) %>% nrow()))
+total <- total %>% add_row(Reason = "Number of deaths before 0.039 years", value = included %>% filter(died > 0 & timeToDeath <= 0.039) %>% nrow())
+
+write.csv(total, "NumberOfEventsBeforeCross.csv")
+
+blVar <- survfit(Surv(timeToDeath, died) ~  SIMD, data = included, robust = TRUE)
+(p <- ggsurvplot(blVar, fun = "cloglog", 
+                 palette = viridis(n = 5),
+                 legend.labs = c("1", "2", "3", "4", "5"),
+                 legend.title = "SIMD quartile"))
+svg("logSurvPlot_SIMD_bl.svg")
+print(p)
+dev.off()
+
+svg("logSurvPlot_SIMD_blAnnotated.svg")
+print((p$plot + 
+         geom_vline(xintercept = 0.05, linetype = 2) + 
+         annotate("text", x = 0.055, y = -0.2, label = "t = 0.05" , vjust = 0, hjust= 0)))
+dev.off()
+
+blVar <- survfit(Surv(timeToDeath, died) ~  af, data = included, robust = TRUE)
+(p <- ggsurvplot(blVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No AF/AFL", "AF/AFL"),
+                 legend.title = "AF/AFL status"))
+svg("logSurvPlot_AF_bl.svg")
+print(p)
+dev.off()
+
+blVar <- survfit(Surv(timeToDeath, died) ~  cad, data = included, robust = TRUE)
+(p <- ggsurvplot(blVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No CAD", "CAD"),
+                 legend.title = "CAD Status"))
+svg("logSurvPlot_cad_bl.svg")
+print(p)
+dev.off()
+
+blVar <- survfit(Surv(timeToDeath, died) ~  dm, data = included, robust = TRUE)
+(p <- ggsurvplot(blVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No DM", "DM"),
+                 legend.title = "DM Status"))
+svg("logSurvPlot_dm_bl.svg")
+print(p)
+dev.off()
+
+blVar <- survfit(Surv(timeToDeath, died) ~  cancer, data = included, robust = TRUE)
+(p <- ggsurvplot(blVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No Cancer", "Cancer"),
+                 legend.title = "Cancer Status"))
+svg("logSurvPlot_cancer_bl.svg")
+print(p)
+dev.off()
+
+blVar <- survfit(Surv(timeToDeath, died) ~  hypertension, data = included, robust = TRUE)
+(p <- ggsurvplot(blVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No Hypertension", "Hypertension"),
+                 legend.title = "Hypertension Status"))
+svg("logSurvPlot_hypertn_bl.svg")
+print(p)
+dev.off()
+
+blVar <- survfit(Surv(timeToDeath, died) ~  valve, data = included, robust = TRUE)
+(p <- ggsurvplot(blVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No Valve Disease", "Valve Disease"),
+                 legend.title = "Valve Disease Status"))
+svg("logSurvPlot_valve_bl.svg")
+print(p)
+dev.off()
+
+
+blVar <- survfit(Surv(timeToDeath, died) ~  stroke, data = included, robust = TRUE)
+(p <- ggsurvplot(blVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No Stroke", "Stroke"),
+                 legend.title = "Stroke Status"))
+svg("logSurvPlot_stroke_bl.svg")
+print(p)
+dev.off()
+
+blVar <- survfit(Surv(timeToDeath, died) ~ pad, data = included, robust = TRUE)
+(p <- ggsurvplot(blVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No PAD", "PAD"),
+                 legend.title = "PAD Status"))
+svg("logSurvPlot_pad_bl.svg")
+print(p)
+dev.off()
+
+blVar <- survfit(Surv(timeToDeath, died) ~  copd, data = included, robust = TRUE)
+(p <- ggsurvplot(blVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No COPD", "COPD"),
+                 legend.title = "COPD Status"))
+svg("logSurvPlot_copd_bl.svg")
+print(p)
+dev.off()
+
+blVar <- survfit(Surv(timeToDeath, died) ~ thyroidDisease, data = included, robust = TRUE)
+(p <- ggsurvplot(blVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No Thyroid Disease", "Thyroid Disease"),
+                 legend.title = "Thyroid Disease Status"))
+svg("logSurvPlot_thyroiddis_bl.svg")
+print(p)
+dev.off()
+
+blVar <- survfit(Surv(timeToDeath, died) ~  dementia, data = included, robust = TRUE)
+(p <- ggsurvplot(blVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No Dementia", "Dementia"),
+                 legend.title = "Dementia Status"))
+svg("logSurvPlot_dementia_bl.svg")
+print(p)
+dev.off()
+
+##Models built to compare different ways of handling missing eGFR data
+###Baseline (no eGFR)
+coxFinalModel.bl <- coxph(Surv(timeToDeath, died) ~ inclusionStatus + ageEnd2011 + sex + SIMD + 
+                            af+ cad + dm + cancer + valve +
+                            hypertension + stroke + pad + copd + thyroidDisease + dementia,
+                            data = included, robust = TRUE)
+
+sink("blModel.txt")
+print(summary(coxFinalModel.bl))
+sink()
+
+###Complete case
+coxFinalModel.blCompCase <- coxph(Surv(timeToDeath, died) ~ inclusionStatus + ageEnd2011 + sex + SIMD + 
+                            af+ cad + dm + cancer + valve +
+                            hypertension + stroke + pad + copd + thyroidDisease + dementia +
+                            pspline(egfr, df = 4), data = included, robust = TRUE)
+
+sink("blModel_completeEgfr_4df.txt")
+print(summary(coxFinalModel.blCompCase))
+sink()
+
+###Relace with median values
+coxFinalModel.blMedian <- coxph(Surv(timeToDeath, died) ~ inclusionStatus + ageEnd2011 + sex + SIMD + 
+                            af+ cad + dm + cancer + valve +
+                            hypertension + stroke + pad + copd + thyroidDisease + dementia +
+                            pspline(egfrMedian, df = 4), data = included, robust = TRUE)
+
+sink("blModel_medianEgfr_4df.txt")
+print(summary(coxFinalModel.blMedian))
+sink()
+
+###Relace with 1st quartile values
+coxFinalModel.bl1stQ <- coxph(Surv(timeToDeath, died) ~ inclusionStatus + ageEnd2011 + sex + SIMD + 
+                            af+ cad + dm + cancer + valve +
+                            hypertension + stroke + pad + copd + thyroidDisease + dementia +
+                            pspline(egfr1stQ, df = 4), data = included, robust = TRUE)
+
+sink("blModel_1stQEgfr_4df.txt")
+print(summary(coxFinalModel.bl1stQ))
+sink()
+
+###Relace with 3rd quartile values
+coxFinalModel.bl3rdQ <- coxph(Surv(timeToDeath, died) ~ inclusionStatus + ageEnd2011 + sex + SIMD + 
+                            af + cad + dm + cancer + valve +
+                            hypertension + stroke + pad + copd + thyroidDisease + dementia +
+                            pspline(egfr3rdQ, df = 4), data = included, robust = TRUE)
+
+sink("blModel_3rdQEgfr_4df.txt")
+print(summary(coxFinalModel.bl3rdQ))
+sink()
+
+##Test for thiazides 
+coxFinalModel.blMedianEgfrThia <- coxph(Surv(timeToDeath, died) ~ inclusionStatus*thiazide + ageEnd2011 + sex + SIMD + 
+                                      af + cad + dm + cancer + valve +
+                                      hypertension + stroke + pad + 
+                                      copd + thyroidDisease + dementia + 
+                                      pspline(egfrMedian, df = 4), data = included, robust = TRUE) 
+
+sink("blModel_MedianEgfrMedInteraction_4df.txt")
+print(summary(coxFinalModel.blMedianEgfrThia))
+sink()
+
+# KM plot
+surv_object_incAH <- Surv(time=included$timeToDeath, event=included$died)
+fit <- survfit(surv_object_incAH ~ inclusionStatus, data = included)
+(ggsurv <- ggsurvplot( fit, data=included, pval=TRUE,
+                      conf.int = TRUE,
+                      risk.table = TRUE,
+                      xlim=c(0,5),
+                      break.time.by=1,
+                      legend = 'none',
+                      tables.theme = theme_cleantable(),
+                      palette = colorsGrouped,
+                      fontsize = 3.5,
+                      #axis.text = element_text(size=10),
+                      #text = element_text(size=10),
+                      legend.labs = c("Neither", "LD Only", "HF Only", "Both: LD + HF"),
+                      tables.height = 0.2) + labs(x = "Time (years)", y = "Survival Probability"))
+
+## add commas
+ggsurv$table$layers[[1]]$data$llabels <- scales::comma(ggsurv$table$layers[[1]]$data$llabels, accuracy = 1)
+
+## save figure
+svg("KM_fromBl_withCommas.svg")
+print(ggsurv)
+dev.off()
+
+
+#########################
+#   Types of mortality  #
+#########################
+#Generate competing risks for underlying causes of death per group (e.g., LD only, HF only, etc.)
+
+count = 1
+
+for(i in levels(included$group)){
+  #subset group
+  subset <- included %>% filter(group == I)
+
+  ci <- cmprsk::cuminc(ftime = subset$timeToDeath, fstatus = subset$codClassification, 
+                          cencode = "Alive")
+  
+  write(capture.output(ci), paste0("group", count, "Ci5YearMort.txt"))
+  
+  #format 
+  ciPlotDat <- ci %>%
+    list_modify("Tests" = NULL) %>% 
+    map_df(`[`, c("time", "est"), .id = "id") %>% 
+    mutate(id = str_replace(id, "^\\S* ", ""))
+
+  
+  subset$group <- droplevels(subset$group)
+
+  melded_fit <- survfit(Surv(timeToDeath, ifelse(codReason != "Alive", 1, 0)) ~ group, 
+                        data = subset)
+
+  #plot
+  (p <- ggplot(ciPlotDat, aes(x = time, y = est, color = id)) +
+      geom_step(lwd = 1.2) + 
+      scale_color_manual(values = mortPal)+
+      theme_classic() + 
+      ylim(c(0,0.3)) +
+      theme(plot.title = element_text(size = 14),
+            legend.title = element_blank(),
+            legend.position = "bottom") +
+      labs(x = "Time (years)", 
+           y = "Cumulative incidence"))
+
+  #create the number at risk table 
+  num <- ggsurvplot(
+    fit = melded_fit, 
+    data = subset,
+    palette = c("black"),
+    risk.table = TRUE,
+    legend.labs = c(i),
+    ylab = "Time (years)", 
+    risk.table.fontsize = 3.2, 
+    tables.theme = theme_survminer(font.main = 14),
+    title = "Tests"
+  )
+  
+  #combine the plot and risk table 
+  (comb <- cowplot::plot_grid(
+    p, 
+    num$table + theme_cleantable(), 
+    ncol = 1, 
+    rel_heights = c(5, 1),
+    align = "v", 
+    axis = "b"
+  ))
+  
+  svg(paste0("group",count,"_cc_ci5YearMortWithTable.svg"))
+  print(comb)
+  dev.off()
+  
+  count = count + 1
+  }
+##################################
+#        LD Only outcomes        #
+##################################
+conn <- odbcDriverConnect("Driver=SQL Server; Server=####; Database=#####")
+raw <- sqlQuery(conn, 'select * from #####.#####' )
+odbcCloseAll()
+
+#Format data
+data_raw_ld <- raw %>% dplyr::filter(included > 0) %>% dplyr::filter(inclusionStatus == 1)
+
+data_raw_ld$group <- factor(data_raw_ld$died, 
+                           levels = c("0", "1"),
+                           labels = c("Censored", "Died"))
+
+data_raw_ld$SIMD <- as.factor(data_raw_ld$SIMD)
+
+data_raw_ld$ethnicity <- as.factor(data_raw_ld$ethnicity)
+data_raw_ld <- data_raw_ld %>% dplyr::mutate(ethnicityGrouped = recode_factor(ethnicity, "Asian" = "Other", "Black" = "Other"))
+data_raw_ld$ethnicityGrouped <- ordered(data_raw_ld$ethnicityGrouped, 
+                                        levels = c("White", "Missing", "Other"))
+
+sample_size <- data_raw_ld %>% dplyr::group_by(group) %>% dplyr::summarize(num = n())
+
+#n
+n <- data_raw_ld %>% dplyr::group_by(group, variable = 'n') %>% 
+  dplyr::summarise(value = bigNumbers(n())) %>% 
+  spread(group, value) %>% as.data.frame() 
+
+#length of follow-up
+fu <- data_raw_ld %>% dplyr::group_by(group, variable = "median length of follow-up (years)") %>% 
+   summarise(value = my.contSummary(timeToDeath, 2)) %>% 
+   spread(group, value ) %>% as.data.frame()
+
+#age
+age <- data_raw_ld %>% dplyr::group_by(group, variable = 'Age (years) at censoring') %>% 
+  dplyr::summarise(value = my.contSummary(ageEnd2011, tableNdps)) %>% 
+  spread(group, value) %>% as.data.frame()
+
+#sex
+sex <- data_raw_ld %>% dplyr::group_by(group, variable =  paste0("Sex split: ",sex)) %>% 
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#ethnicity
+ ethnicity <- data_raw_ld %>% dplyr::group_by(group, variable = paste0("Ethnicity: ", ethnicityGrouped)) %>% 
+   dplyr::summarise(top = n()) %>% 
+   dplyr::full_join (sample_size) %>%
+   dplyr::mutate(top = replace_na(top, 0)) %>%
+   #dplyr::mutate(variable = replace_na(variable, "ethnicityGrouped")) %>% 
+   dplyr::mutate(per = (top/(num*1.0))*100) %>%
+   dplyr::mutate(value = my.factSummaryOld(per, top, tableNdps)) %>% 
+   dplyr::select(-c(top, num, per))%>%
+   spread(group, value) %>% as.data.frame()
+
+#SIMD
+SIMD <- data_raw_ld %>% dplyr::group_by(group, variable = paste0("SIMD quintile: ",SIMD)) %>% 
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  # dplyr::mutate(variable = replace_na(variable, "SIMD")) %>% 
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#AF
+af <- data_raw_ld %>% dplyr::filter(af > 0) %>% 
+  dplyr::group_by(group, variable = "Atrial fibrillation/flutter") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#valve disease
+valve <- data_raw_ld %>% dplyr::filter(valve > 0) %>% 
+  dplyr::group_by(group, variable = "Valve disease") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#hyptertension
+hypertension <- data_raw_ld %>% dplyr::filter(hypertension > 0) %>% 
+  dplyr::group_by(group, variable = "Hypertension") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#diabetes mellitus
+dm <- data_raw_ld %>% dplyr::filter(dm > 0) %>% 
+  dplyr::group_by(group, variable = "Diabetes mellitus") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#CAD
+cad <- data_raw_ld %>% dplyr::filter(cad > 0) %>% 
+  dplyr::group_by(group, variable = "CAD (including MI)") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(variable = replace_na (variable, "CAD (including MI)")) %>% 
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+MI
+mi <- data_raw_ld %>% dplyr::filter(mi > 0) %>% 
+  dplyr::group_by(group, variable = "Myocardial infarction") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#PAD
+pad <- data_raw_ld %>% dplyr::filter(pad > 0) %>% 
+  dplyr::group_by(group, variable = "Peripheral arterial disease") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#cancer
+cancer <- data_raw_ld %>% dplyr::filter(cancer > 0) %>% 
+  dplyr::group_by(group, variable = "Cancer") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#stroke
+stroke <- data_raw_ld %>% dplyr::filter(stroke > 0) %>% 
+  dplyr::group_by(group, variable = "Stroke") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#dementia
+dementia <- data_raw_ld %>% dplyr::filter(dementia > 0) %>% 
+  dplyr::group_by(group, variable = "Dementia") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#copd
+copd <- data_raw_ld %>% dplyr::filter(copd > 0) %>% 
+  dplyr::group_by(group, variable = "COPD") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#thyroid
+thyroid <- data_raw_ld %>% dplyr::filter(thyroidDisease > 0) %>% 
+  dplyr::group_by(group, variable = "Thyroid disease") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+#liver disease, defined by the presence of liver fibrosis, sclerosis, or cirrhosis 
+liver <- data_raw_ld %>% dplyr::filter(liver > 0) %>% 
+  dplyr::group_by(group, variable = "liver") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+numHypertensionMeds3 <- data_raw_ld %>% dplyr::filter(numHypertensionMeds >= 3) %>% 
+  dplyr::group_by(group, variable = "Dispensed >= 3 antihyperensive agents") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  spread(group, value) %>% as.data.frame()
+
+ldTable <- bind_rows(n, age, fu, sex, ethnicity, SIMD, hypertension, dm, thyroid, 
+                    cad, mi, hc, pad, valve, af, stroke, copd, cancer, liver, dementia) 
+
+write.csv(ldTable, "LDOnlyOutcomes.csv")
+
+#quintiles of age 
+data_raw_ld <- data_raw_ld %>% dplyr::mutate(quartile = ntile(ageEnd2011, 5))
+##prep data
+data_raw_ld <- data_raw_ld %>% dplyr::group_by(quartile) %>% dplyr::mutate(ageLabel = paste0(round(min(ageEnd2011), 1), "-", round(max(ageEnd2011), 1), " years"))
+data_raw_ld$ageLabel <- as.factor(data_raw_ld$ageLabel)
+
+#KM plot by quintile of age for LD only
+surv_object <- Surv(time=data_raw_ld$timeToDeath, event=data_raw_ld$died)
+fit <- survfit(surv_object ~ ageLabel, data = data_raw_ld)
+(ggsurv <- ggsurvplot( fit, data=data_raw_ld, pval=TRUE,
+                       conf.int = TRUE,
+                       risk.table = TRUE,
+                       break.time.by=1,
+                       legend = 'none',
+                       tables.theme = theme_cleantable(),
+                       palette = viridis(5,  direction = -1),
+                       fontsize = 3.5,
+                       tables.height =0.2,
+                       legend.labs = c("\u003c 62.5 yrs", "62.5-71.8 yrs", "71.9-78.3 yrs", '78.4-84.3 yrs', "\u2265 84.4 yrs"),                      ) +
+                      labs(x = "Time (years)", y = "Survival Probability")
+    )
+
+#add thousands place separator 
+ggsurv$table$layers[[1]]$data$llabels <- scales::comma(ggsurv$table$layers[[1]]$data$llabels, accuracy = 1)
+svg("KM_LD_fromBl_withCommas.svg")
+print(ggsurv)
+dev.off()
+
+#Find those whose inclusion reason was repeat dispending of loop diuretic
+ldStats <- function(column){
+  n <- column %>% dplyr::group_by(variable = 'n') %>% 
+    dplyr::summarise(value = bigNumbers(n())) %>% 
+    as.data.frame() 
+
+#sex
+sex <- column %>% dplyr::group_by(variable =  paste0("Sex split: ",sex)) %>% 
+  dplyr::summarise(top = n()) %>% 
+  add_column(num = sample_size$num) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  as.data.frame()
+
+#CAD
+cad <- column  %>% dplyr::filter(cad > 0) %>% 
+  dplyr::group_by(variable = "CAD (including MI)") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::mutate(variable = replace_na (variable, "CAD (including MI)")) %>% 
+  add_column(num = sample_size$num) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  as.data.frame()
+
+#PAD
+pad <- column %>% dplyr::filter(pad > 0) %>% 
+  dplyr::group_by(variable = "Peripheral arterial disease") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::mutate(variable = replace_na (variable, "Peripheral arterial disease")) %>% 
+  add_column(num = sample_size$num) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  as.data.frame()
+
+#died during follow-up 
+died <- column %>% dplyr::filter(died > 0) %>% 
+  dplyr::group_by(variable = "Died by 2016-12-31") %>%
+  dplyr::summarise(top = n()) %>% 
+  add_column(num = sample_size$num) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(variable = replace_na(variable, "Died by 2016-12-31")) %>% 
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per))%>%
+  as.data.frame()
+
+tab <- bind_rows(n, sex, cad, pad, died)
+
+return(tab)
+}
+
+#LD only reason for inclusion
+ldOnly <-  included %>% dplyr::filter(inclusionStatusSplit == 1) %>% dplyr::filter(hxPAD == 0) %>% dplyr::filter(hxCAD == 0) %>% dplyr::filter(rxBB == 0) %>%
+    dplyr::filter(rxRAASi == 0)
+onlyStat <- ldStats(ldOnly)
+
+#LD only, no remote PAD or CAD  history 
+ldOnlyNoRemote <- ldOnly %>% dplyr::filter(pad == 0) %>% dplyr::filter(cad == 0) 
+noRemoteStat <- ldStats(ldOnlyNoRemote)
+
+#CVD reason 
+ldOnlyHxRx <-  ldOnly %>% dplyr::filter(hxPAD > 0 | hxCAD > 0 | rxBB > 0 | rxRAASi > 0) 
+onlyHxRxStat <- ldStats(ldOnlyHxRx)
+
+
+##################################
+#   Time dependent covaraites    #
+##################################
+conn <- odbcDriverConnect("Driver=SQL Server; Server=####; Database=####")
+data_raw_tdc <- sqlQuery(conn, 'select * from ####' )
+odbcCloseAll()
+
+##################################
+#     Print transition data     #
+##################################
+tdc <- data_raw_tdc
+
+tdc$updatedGroupSplit <- factor(tdc$updatedGroupSplit, 
+                                          levels = c( "-1", "0", "1", "2", "3"),
+                                          labels = c("Neither (18-59 yrs)", "Neither (\u2265 60 yrs)", "LD Only", "HF Only", "Both: LD + HF"))
+tdc$updatedGroup <- factor(tdc$updatedGroup, 
+                                      levels = c( "0", "1", "2", "3"),
+                                      labels = c("Neither", "LD Only", "HF Only", "Both: LD + HF"))
+
+tdc$Group <- factor(tdc$Group, 
+                                 levels = c( "0", "1", "2", "3"),
+                                 labels = c("Neither", "LD Only", "HF Only", "Both: LD + HF"))
+
+tdc$finalStatus <- factor(tdc$finalStatus, 
+                          levels = c( "0", "1", "2", "3"),
+                          labels = c("Neither", "LD Only", "HF Only", "Both: LD + HF"))
+tdc$prevStatusSplit <- factor(tdc$prevStatusSplit, 
+                         levels = c("-2",  "-1", "0", "1", "2", "3"),
+                         labels = c("Start","Neither (18-59 yrs)", "Neither (\u2265 60 yrs)", "LD Only", "HF Only", "Both: LD + HF" ))
+tdc$prevStatus <- factor(tdc$prevStatus, 
+                              levels = c("-2",  "0", "1", "2", "3"),
+                              labels = c("Start","Neither",  "LD Only", "HF Only", "Both: LD + HF" ))
+
+#group movements
+both <- tdc %>% filter(Group == "Both: LD + HF")
+both %>% group_by(sex) %>% summarise(n = n(), died = sum(died))
+both %>% summarise(n = n(), died = sum(died))
+
+hf <- tdc %>% filter(Group == "HF Only")
+hf %>% filter(transNumber == 1) %>% summarise(n = n(), died = sum(died))
+hf %>% filter(transNumber == 2) %>% summarise(n = n(), died = sum(died))
+hf %>% summarise(died = sum(died))
+
+ld <- tdc %>% filter(Group == "LD Only")
+ld %>% filter(transNumber == 1) %>% summarise(n = n(), died = sum(died))
+ld %>% filter(transNumber == 2) %>% summarise(n = n(), died = sum(died))
+ld %>% summarise(died = sum(died))
+
+arYoung <- tdc %>% filter(Group == "Neither" & ageEnd2011 < 60)
+arYoung %>% filter(transNumber == 1) %>% group_by(updatedGroup) %>% summarise(n = n(), died = sum(died))
+arYoung %>% filter(transNumber == 2) %>% group_by(updatedGroup) %>% summarise(n = n(), died = sum(died))
+arYoung %>% filter(transNumber == 3) %>% group_by(prevStatus) %>% summarise(n = n(), died = sum(died))
+arYoung %>% filter(transNumber == 3) %>% group_by(updatedGroup) %>% summarise(n = n(), died = sum(died))
+arYoung %>% summarise(died = sum(died))
+
+ar <- tdc %>% filter(Group == "Neither" & ageEnd2011 >= 60)
+ar %>% filter(transNumber == 1) %>% group_by(updatedGroup) %>% summarise(n = n(), died = sum(died))
+ar %>% filter(transNumber == 2) %>% group_by(updatedGroup) %>% summarise(n = n(), died = sum(died))
+ar %>% filter(transNumber == 3) %>% group_by(prevStatus) %>% summarise(n = n(), died = sum(died))
+ar %>% filter(transNumber == 3) %>% group_by(updatedGroup) %>% summarise(n = n(), died = sum(died))
+ar %>% summarise(died = sum(died))
+
+
+tdc$SIMD <- as.factor(tdc$SIMD)
+
+##########################################################################
+#         Time Dependent Covariates   Morbidity and Mortality            #
+##########################################################################
+
+#format data
+sample_size <- tdc %>% dplyr::group_by(updatedGroupSplit) %>% dplyr::summarize(num = n(), pt = sum(numDaysFree)/365.25)
+
+sample_sizeMort <- tdc %>% dplyr::group_by(updatedGroupSplit) %>% dplyr::summarize(num = n(), pt = sum(numDaysAlive)/365.25)
+
+tdc$codReason <- factor(tdc$codReason,
+                                   levels = c("-1", "0", "1", "2", 
+                                              "3", "4"),
+                                   labels = c("Remove", "Alive", "Cardiovascular", 
+                                              "Neoplasm", "Infection",
+                                              "Other"))
+
+#number
+n <- tdc %>% dplyr::group_by(updatedGroupSplit, variable = 'n') %>% 
+  dplyr::summarise(value = bigNumbers(n())) %>% 
+  spread(updatedGroupSplit, value) %>% as.data.frame() 
+
+#died during follow-up
+died <- tdc %>% dplyr::filter(died > 0) %>% 
+  dplyr::group_by(updatedGroupSplit, variable = "Died") %>%
+  dplyr::summarise(top = n()) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+  dplyr::select(-c(top, num, per, pt))%>%
+  spread(updatedGroupSplit, value) %>% as.data.frame()
+
+#formatted for figures, causes of mortality by patient-year at risk
+reasonForMortPt <- tdc %>% dplyr::group_by(updatedGroupSplit, variable = codReason) %>% 
+  dplyr::summarise(top = sum(died)) %>% 
+  dplyr::full_join (sample_sizeMort) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+#formatted for table, causes of mortality by patient-year at risk
+reasonForMortP <- tdc %>% dplyr::filter(died > 0) %>% 
+  dplyr::group_by(updatedGroupSplit, variable = codReason) %>% 
+  dplyr::summarise(top = sum(died)) %>% 
+  dplyr::full_join (sample_sizeMort) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>%
+  dplyr::mutate(value = my.irSummary(ir, top, personTimeNdps)) %>% 
+  dplyr::select(-c(top, ir, num, pt, per))%>%
+  spread(updatedGroupSplit, value) %>% as.data.frame()
+
+#HF admissions per patient-year at risk
+hfAdmit <- tdc %>% dplyr::filter(!is.na(firstHospAdmDate)) %>%
+  dplyr::group_by(updatedGroupSplit, variable = "HF") %>% 
+  dplyr::summarise(top = sum(numHfHospAdmit)) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+#cv other admissions per patient-year at risk
+cvOtherAdmit <- tdc %>% dplyr::filter(!is.na(firstHospAdmDate)) %>%
+  dplyr::group_by(updatedGroupSplit, variable = "CV Other") %>% 
+  dplyr::summarise(top = sum(numCvOtherHospAdmit)) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+#renal admissions per patient-year at risk
+renalAdmit <- tdc %>% dplyr::filter(!is.na(firstHospAdmDate)) %>%
+  dplyr::group_by(updatedGroupSplit, variable = "Renal") %>% 
+  dplyr::summarise(top = sum(numRenalHospAdmit)) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+#eye and adnexa admissions per patient-year at risk
+eyeAdmit <- tdc %>% dplyr::filter(!is.na(firstHospAdmDate)) %>%
+  dplyr::group_by(updatedGroupSplit, variable = "Eye & Adnexa") %>% 
+  dplyr::summarise(top = sum(numEyeHospAdmit)) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+#digestive admissions per patient-year at risk
+giAdmit <- tdc %>% dplyr::filter(!is.na(firstHospAdmDate)) %>%
+  dplyr::group_by(updatedGroupSplit, variable = "Digestive disease") %>% 
+  dplyr::summarise(top = sum(numGiHospAdmit)) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+#Chronic respiratory disease admissions per patient-year at risk
+respAdmit <- tdc %>% dplyr::filter(!is.na(firstHospAdmDate)) %>%
+  dplyr::group_by(updatedGroupSplit, variable = "Chronic respiratory disease") %>% 
+  dplyr::summarise(top = sum(numRespHospAdmit)) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+#Infection admissions per patient-year at risk
+infectAdmit <- tdc %>% dplyr::filter(!is.na(firstHospAdmDate)) %>%
+  dplyr::group_by(updatedGroupSplit, variable = "Infection") %>% 
+  dplyr::summarise(top = sum(numInfectHospAdmit)) %>%
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+#injury admissions per patient-year at risk
+injuryAdmit <- tdc %>% dplyr::filter(!is.na(firstHospAdmDate)) %>% 
+  dplyr::group_by(updatedGroupSplit, variable = "Injury") %>% 
+  dplyr::summarise(top = sum(numInjuryHospAdmit)) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+#Mental health & neurological disorders admissions per patient-year at risk
+mentNeuroAdmit <- tdc %>% dplyr::filter(!is.na(firstHospAdmDate)) %>% 
+  dplyr::group_by(updatedGroupSplit, variable = "Mental health & neurological disorders") %>% 
+  dplyr::summarise(top = sum(numMentNeuroHospAdmit)) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+#Musculoskeletal admissions per patient-year at risk
+mskAdmit <- tdc %>% dplyr::filter(!is.na(firstHospAdmDate)) %>% 
+  dplyr::group_by(updatedGroupSplit, variable = "Musculoskeletal") %>% 
+  dplyr::summarise(top = sum(numMskHospAdmit)) %>%
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(top = replace_na(top, 0)) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+#Neoplasm admissions per patient-year at risk
+neopAdmit <- tdc %>% dplyr::filter(!is.na(firstHospAdmDate)) %>% 
+  dplyr::group_by(updatedGroupSplit, variable = "Neoplasm") %>% 
+  dplyr::summarise(top = sum(numNeoplasmHospAdmit)) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+#other admissions per patient-year at risk
+otherAdmit <- tdc %>% dplyr::filter(!is.na(firstHospAdmDate)) %>% 
+  dplyr::group_by(updatedGroupSplit, variable = "Other") %>% 
+  dplyr::summarise(top = sum(numOtherHospAdmit)) %>% 
+  dplyr::full_join (sample_size) %>%
+  dplyr::mutate(per = (top/(num*1.0))*100) %>%
+  dplyr::mutate(ir = (top/pt)*personTimeScale) %>% 
+  dplyr::mutate(value = ir) %>% 
+  dplyr::select(-c(top, num, ir, pt, per))%>%
+  as.data.frame()
+
+tdcMandM <- bind_rows(n, died, reasonForMortP, numAdmissions)
+
+write.csv(tdcMandM, "MandMRates.csv")
+
+#pull together admission types per patient-year at risk
+admitPt <- bind_rows(hfAdmit, cvOtherAdmit, respAdmit, infectAdmit, neopAdmit,
+                renalAdmit, eyeAdmit, giAdmit,
+                 injuryAdmit, mentNeuroAdmit, 
+                mskAdmit,  otherAdmit)
+
+admitPt$variable <- factor(admitPt$variable, levels=unique(admitPt$variable))
+
+svg("mortRateByGroup.svg")
+(p <- reasonForMortPt %>%dplyr::filter(variable != "Alive") %>%
+    ggplot(aes(x=updatedGroupSplit, y = value, fill = variable)) + 
+    geom_bar(stat='identity', color = 'white') +
+    theme_classic()  + 
+    scale_fill_manual(values = mortPal) +
+    xlab ('Group') + 
+    ylab ('Number of deaths\n per patient-year at risk')+ 
+    theme(axis.text.x = element_text(angle=45, hjust = 1))+
+    guides(fill=guide_legend(title = "Cause of death")))
+print(p)
+dev.off()
+
+svg("hospRateByGroupDodge.svg")
+(p <- ggplot(admitPt, aes(x=variable, y = value, fill = updatedGroupSplit)) + 
+  geom_bar(stat='identity',position = 'dodge', color = 'white') +
+  theme_classic()  + 
+  scale_fill_manual(values = colorsActiveBarGraph,  name = "Group") + 
+  xlab ('Admission Reason') + 
+  ylab ('Number of admissions\n per patient-year at risk')+ 
+  theme(axis.text.x = element_text(angle=45, hjust = 1))+
+    guides(fill=guide_legend(title = "Group")))
+print(p)
+dev.off()
+
+(p <- ggplot(admitPt, aes(x=updatedGroupSplit, y = value, fill = variable)) + 
+  geom_bar(stat='identity', color = 'white') +
+  theme_classic()  + 
+    scale_fill_viridis_d(option = "turbo", direction = -1) +
+  xlab ('Group') + 
+  ylab ('Number of admissions\n per patient-year at risk')+ 
+  theme(axis.text.x = element_text(angle=45, hjust = 1))+
+    guides(fill=guide_legend(title = "Admission Reason")))
+svg("hospRateByGroup.svg")
+print(p)
+dev.off()
+
+#format data for Cox proportional hazards (Cox PH) regression 
+tdc$SIMD <- relevel(tdc$SIMD, ref = "5")
+tdc <- tdc %>% dplyr::mutate(ageDec = ageEnd2011/10)
+
+#Assumption testings for Cox PH
+##cutting age up into deciles 
+tdc <- tdc %>% mutate(decAges = gtools::quantcut(ageEnd2011, q = 10))
+
+hold <- aggregate(ageEnd2011~ decAges, data = tdc, FUN = mean)
+coxcheckAge <- coxph(Surv(time1, time2, died) ~ Group + decAges + sex + SIMD + 
+                       sex + SIMD + updatedAf+ updatedCad+ updatedDm + updatedCancer + updatedValve +
+                       updatedHypertension + updatedStroke + updatedPad + updatedCopd + updatedThyroidDisease + updatedDementia, data = tdc)
+
+
+logHazards <- c(0, 0.44097, 0.79858, 1.17058, 1.47185, 1.78732, 2.10052,  2.39149, 2.73712,  3.38145)
+meanAges <- c(33.45168, 47.50143, 53.92636, 59.10257, 63.71909, 67.86982, 72.13623, 76.22870, 80.70356, 87.81572)
+tdcCoxCheckAge <- data.frame(logHazards,meanAges)
+
+svg("logHazardsCoxAgeMeanDecile_tdc.svg")
+plot( tdcCoxCheckAge$meanAges, tdcCoxCheckAge$logHazards, pch = 19, xlab = "Mean value of age within each decile of age", ylab = "Log-hazards from Cox regression" )
+abline(coef = c(0,1), col="red", lwd = 2)
+dev.off()
+#effect of age is largely linear .: using linear by decade adjustment
+
+tdcGroupCox <- survfit(Surv(time1, time2, died) ~  updatedGroup, data = tdc, robust = TRUE, cluster = safehavenid)
+(p <- ggsurvplot(tdcGroupCox, fun = "cloglog", 
+           palette = colorsGrouped,
+           legend.labs = c(
+             "Neither",
+             "LD Only",
+             "HF Only",
+             "Both: LD + HF"),
+           legend.title = "Group")) 
+svg("logSurvPlot_group_tdc.svg")
+print(p)
+dev.off()
+
+plot(tdcGroupCox, fun = "cloglog")
+(p <- ggsurvplot(tdcGroupCox, fun = "cloglog", 
+                 palette = colorsGrouped,
+                 legend.labs = c(
+                   "Neither",
+                   "LD Only",
+                   "HF Only",
+                   "Both: LD + HF"),
+                 legend.title = "Group") )
+(p$plot + 
+    geom_vline(xintercept = 0.039))
+svg("logSurvPlot_group_tdcAnnotated.svg")
+print((p$plot + 
+         geom_vline(xintercept = 0.039, linetype = 2) + 
+         annotate("text", x = 0.041, y = -0.2, label = "t = 0.039" , vjust = 0, hjust= 0)))
+dev.off()
+
+tdcVar <- survfit(Surv(time1, time2, died) ~  sex, data = tdc, robust = TRUE, cluster = safehavenid)
+(p <- ggsurvplot(tdcVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("Women", "Men"),
+                 legend.title = "Sex"))
+svg("logSurvPlot_sex_tdc.svg")
+print(p)
+dev.off()
+
+tdcVar <- survfit(Surv(time1, time2, died) ~  SIMD, data = tdc, robust = TRUE, cluster = safehavenid)
+(p <- ggsurvplot(tdcVar, fun = "cloglog", 
+                 palette = viridis(n = 5),
+                 legend.labs = c("1", "2", "3", "4", "5"),
+                 legend.title = "SIMD quartile"))
+svg("logSurvPlot_SIMD_tdc.svg")
+print(p)
+dev.off()
+
+tdcVar <- survfit(Surv(time1, time2, died) ~  updatedAf, data = tdc, robust = TRUE, cluster = safehavenid)
+(p <- ggsurvplot(tdcVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No AF/AFL", "AF/AFL"),
+                 legend.title = "AF/AFL status"))
+svg("logSurvPlot_AF_tdc.svg")
+print(p)
+dev.off()
+
+
+tdcVar <- survfit(Surv(time1, time2, died) ~  updatedCad, data = tdc, robust = TRUE, cluster = safehavenid)
+(p <- ggsurvplot(tdcVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No CAD", "CAD"),
+                 legend.title = "CAD Status"))
+svg("logSurvPlot_cad_tdc.svg")
+print(p)
+dev.off()
+
+tdcVar <- survfit(Surv(time1, time2, died) ~  updatedDm, data = tdc, robust = TRUE, cluster = safehavenid)
+(p <- ggsurvplot(tdcVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No DM", "DM"),
+                 legend.title = "DM Status"))
+svg("logSurvPlot_dm_tdc.svg")
+print(p)
+dev.off()
+
+
+tdcVar <- survfit(Surv(time1, time2, died) ~  updatedCancer, data = tdc, robust = TRUE, cluster = safehavenid)
+(p <- ggsurvplot(tdcVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No Cancer", "Cancer"),
+                 legend.title = "Cancer Status"))
+svg("logSurvPlot_cancer_tdc.svg")
+print(p)
+dev.off()
+
+tdcVar <- survfit(Surv(time1, time2, died) ~  updatedHypertension, data = tdc, robust = TRUE, cluster = safehavenid)
+(p <- ggsurvplot(tdcVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No Hypertension", "Hypertension"),
+                 legend.title = "Hypertension Status"))
+svg("logSurvPlot_hypertn_tdc.svg")
+print(p)
+dev.off()
+
+tdcVar <- survfit(Surv(time1, time2, died) ~  updatedValve, data = tdc, robust = TRUE, cluster = safehavenid)
+(p <- ggsurvplot(tdcVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No Valve Disease", "Valve Disease"),
+                 legend.title = "Valve Disease Status"))
+svg("logSurvPlot_valve_tdc.svg")
+print(p)
+dev.off()
+
+
+tdcVar <- survfit(Surv(time1, time2, died) ~  updatedStroke, data = tdc, robust = TRUE, cluster = safehavenid)
+(p <- ggsurvplot(tdcVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No Stroke", "Stroke"),
+                 legend.title = "Stroke Status"))
+svg("logSurvPlot_stroke_tdc.svg")
+print(p)
+dev.off()
+
+tdcVar <- survfit(Surv(time1, time2, died) ~  updatedPad, data = tdc, robust = TRUE, cluster = safehavenid)
+(p <- ggsurvplot(tdcVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No PAD", "PAD"),
+                 legend.title = "PAD Status"))
+svg("logSurvPlot_pad_tdc.svg")
+print(p)
+dev.off()
+
+tdcVar <- survfit(Surv(time1, time2, died) ~  updatedCopd, data = tdc, robust = TRUE, cluster = safehavenid)
+(p <- ggsurvplot(tdcVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No COPD", "COPD"),
+                 legend.title = "COPD Status"))
+svg("logSurvPlot_copd_tdc.svg")
+print(p)
+dev.off()
+
+tdcVar <- survfit(Surv(time1, time2, died) ~  updatedThyroidDisease, data = tdc, robust = TRUE, cluster = safehavenid)
+(p <- ggsurvplot(tdcVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No Thyroid Disease", "Thyroid Disease"),
+                 legend.title = "Thyroid Disease Status"))
+svg("logSurvPlot_thyroiddis_tdc.svg")
+print(p)
+dev.off()
+
+tdcVar <- survfit(Surv(time1, time2, died) ~  updatedDementia, data = tdc, robust = TRUE, cluster = safehavenid)
+(p <- ggsurvplot(tdcVar, fun = "cloglog", 
+                 palette = c("red", "black"),
+                 legend.labs = c("No Dementia", "Dementia"),
+                 legend.title = "Dementia Status"))
+svg("logSurvPlot_dementia_tdc.svg")
+print(p)
+dev.off()
+
+## adding eGFR
+###Table on missingness around eGFR
+egfrAvailable <- tdc %>% dplyr::filter(!is.na(updatedEgfr))
+sample_sizeEgfr <- egfrAvailable %>%  dplyr::group_by(updatedGroupSplit) %>% dplyr::summarize(num = n())
+sample_size <- tdc %>% dplyr::group_by(updatedGroupSplit) %>% dplyr::summarize(num = n())
+
+####n
+n <- tdc %>% dplyr::group_by(updatedGroupSplit, variable = 'n') %>% 
+  dplyr::summarise(value = bigNumbers(n())) %>% 
+  spread(updatedGroupSplit, value) %>% as.data.frame() 
+
+####age at baseline 
+age <- tdc %>% dplyr::group_by(updatedGroupSplit, variable = 'Age (years)') %>% 
+  dplyr::summarise(value = my.contSummary(ageEnd2011, tableNdps)) %>% 
+  spread(updatedGroupSplit, value) %>% as.data.frame()
+
+####Updated age
+ageU <- tdc %>% dplyr::group_by(updatedGroupSplit, variable = 'Time-dependent age (years)') %>% 
+  dplyr::summarise(value = my.contSummary(progressAge, tableNdps)) %>% 
+  spread(updatedGroupSplit, value) %>% as.data.frame()
+
+####eGFR available
+egfrIn2Prior <- tdc %>% dplyr::filter(!is.na(updatedEgfr)) %>% 
+     dplyr::group_by(updatedGroupSplit, variable = "Patient-record of eGFR in prior 2 years") %>%
+     dplyr::summarise(top = n()) %>% 
+     dplyr::full_join (sample_size) %>%
+     dplyr::mutate(top = replace_na(top, 0)) %>%
+     dplyr::mutate(per = (top/(num*1.0))*100) %>%
+     dplyr::mutate(value = my.factSummary(per, top, tableNdps)) %>% 
+     dplyr::select(-c(top, num, per))%>%
+     spread(updatedGroupSplit, value) %>% as.data.frame()
+
+####eGFR value
+egfr <- tdc %>% dplyr::filter(!is.na(updatedEgfr)) %>% 
+  dplyr::group_by(updatedGroupSplit, variable = 'eGFR ml/min/1.73m2') %>% 
+  dplyr::summarise(value = my.contSummary(updatedEgfr, tableNdps)) %>% 
+  spread(updatedGroupSplit, value) %>% as.data.frame()
+
+tdc_egfr <- bind_rows(n, age, ageU, egfrIn2Prior, egfr)
+write.csv(tdc_egfr, 'TDC_eGFR_values.csv')
+
+###Base model
+final.tdc <- coxph(Surv(time1, time2, died) ~  updatedGroup + 
+                     ageEnd2011 + sex + SIMD + updatedAf+ updatedCad + updatedDm + updatedCancer +
+                     updatedHypertension + updatedStroke + updatedPad + updatedCopd + updatedValve +
+                     updatedThyroidDisease + updatedDementia, data = tdc, robust = TRUE, cluster = safehavenid)
+
+sink("tdcModel.txt")
+print(summary(final.tdc))
+sink()
+
+###Complete case eGFR
+coxFinalModel.tdcEgfr <- coxph(Surv(time1, time2, died) ~ updatedGroup + 
+                              ageEnd2011 + sex + SIMD + updatedAf + updatedCad + updatedDm + updatedCancer +
+                              updatedHypertension + updatedStroke + updatedPad + updatedCopd + updatedValve +
+                              updatedThyroidDisease + updatedDementia +
+                              pspline(updatedEgfr, df = 4), data = tdc, robust = TRUE, cluster = safehavenid) 
+sink("tdcModel_Egfr_4df.txt")
+print(summary(coxFinalModel.tdcEgfr))
+sink()
+
+#Median eGFR
+coxFinalModel.tdcMedianEgfr <- coxph(Surv(time1, time2, died) ~ updatedGroup + ageEnd2011 + sex + SIMD + 
+                                      updatedAf+ updatedCad+ updatedDm + updatedCancer +
+                                      updatedHypertension + updatedStroke + updatedPad + updatedCopd + updatedValve +
+                                      updatedThyroidDisease + updatedDementia +
+                                     pspline(updatedEgfrMedian, df = 4), data = tdc, robust = TRUE, cluster = safehavenid) 
+sink("tdcModel_MedianEgfr_4df.txt")
+print(summary(coxFinalModel.tdcMedianEgfr))
+sink()
+
+###1st quartile eGFR
+coxFinalModel.tdc1stQEgfr <- coxph(Surv(time1, time2, died) ~ updatedGroup + ageEnd2011 + sex + SIMD + 
+                                     updatedAf+ updatedCad+ updatedDm + updatedCancer +
+                                     updatedHypertension + updatedStroke + updatedPad + updatedCopd + updatedValve + 
+                                     updatedThyroidDisease + updatedDementia +
+                                     pspline(updatedEgfr1stQ, df = 4), data = tdc, robust = TRUE, cluster = safehavenid) 
+
+sink("tdcModel_1stQEgfr_4df.txt")
+print(summary(coxFinalModel.tdc1stQEgfr))
+sink()
+
+### 3rd quartile eGFR
+coxFinalModel.tdc3rdQEgfr <- coxph(Surv(time1, time2, died) ~ updatedGroup + ageEnd2011 + sex + SIMD + 
+                                    updatedAf+ updatedCad+ updatedDm + updatedCancer +
+                                    updatedHypertension + updatedStroke + updatedPad + updatedCopd + updatedValve + 
+                                    updatedThyroidDisease + updatedDementia +
+                                    pspline(updatedEgfr3rdQ, df = 4), data = tdc, robust = TRUE, cluster = safehavenid) 
